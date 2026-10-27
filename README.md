@@ -57,7 +57,9 @@ A true DAW-style horizontal graphic EQ (32 Hz to 16 kHz). Tune in precision ±0.
 </p>
 
 ### Firmware Diagnostics & Pre-Flight Flasher
-Live dual-node telemetry monitoring Dongle & Headset version parity, battery safety reserve (>30%), and transport routes. Browse the complete official Maxwell 2 changelog (`v1.0.5.7.4` to `v1.0.2.49`) with keyboard scrolling, and flash updates protected by Airoha dual-bank recovery.
+Live dual-node telemetry monitoring Dongle & Headset version parity, battery safety reserve (>= 50%), and transport routes. Browse the complete official Maxwell 2 changelog (`v1.0.5.7.4` to `v1.0.2.49`) with keyboard scrolling, and inspect and verify official firmware packages, including the separate **Maxwell 2 ANC** firmware track.
+
+> **Maxwell 2 flashing is dry-run only for now.** Maxwell 2 firmware targets the Airoha AB1565_ULL2 (dongle) and AB1585 (headset) chips. The FOTA transfer has not been verified on these chips, so live flashing is refused until USB captures of the official updater confirm it. Regular and ANC Maxwell 2 firmware use the same chips but are not interchangeable: the tool refuses to flash or recommend firmware from the wrong track.
 
 **Keybindings:** `↑`/`↓` scroll changelog · `r` refresh telemetry
 
@@ -116,6 +118,7 @@ audezeforlinux dashboard
 | **Maxwell 2 (Xbox Dongle)** | `3329:4B28` | Wireless 2.4 GHz Dongle | **Verified & Tested (Active)** |
 | **Maxwell 2 (PlayStation / PC Dongle)** | `3329:4B29` | Wireless 2.4 GHz Dongle | Supported |
 | **Maxwell 2 (Direct USB-C)** | `3329:4B2A` | Direct USB Audio / HID | Supported |
+| **Maxwell 2 ANC** | Unknown | — | Firmware packages recognised; device IDs needed ([open an issue](https://github.com/junaydirfan/audezeforlinux/issues) with your `lsusb` output) |
 | **Maxwell 1 (Xbox Dongle)** | `3329:4B18` | Wireless 2.4 GHz Dongle | Supported |
 | **Maxwell 1 (PlayStation Dongle)** | `3329:4B19` | Wireless 2.4 GHz Dongle | Supported |
 | **Maxwell 1 (PlayStation USB-C)** | `3329:4B1A` | Direct USB Audio / HID | Supported |
@@ -171,10 +174,13 @@ audezeforlinux firmware status
 # Check official Audeze release catalog and changelogs against installed version
 audezeforlinux firmware check
 
-# Inspect an official .bin firmware package (SHA-256 partition verification)
+# Compare a downloaded package against the installed version (flags wrong-track ANC/regular packages)
+audezeforlinux firmware check --package path/to/maxwell_firmware.bin
+
+# Inspect an official .bin firmware package (chip id, firmware track, SHA-256 partition verification)
 audezeforlinux firmware inspect path/to/maxwell_firmware.bin
 
-# Stream firmware update with dual-bank recovery safety (dry-run by default)
+# Simulate a firmware update (Maxwell 2 packages are dry-run only for now)
 audezeforlinux firmware flash path/to/maxwell_firmware.bin --target dongle --dry-run
 ```
 
@@ -220,7 +226,7 @@ To maintain production stability and security, `audezeforlinux` incorporates con
 
 - [docs/PROTOCOL.md](docs/PROTOCOL.md): Detailed breakdown of Airoha RACE protocol framing, opcode reference, and memory layouts.
 - [docs/DEVICE.md](docs/DEVICE.md): USB interface tree, endpoint addresses, and report descriptor breakdown.
-- [docs/FIRMWARE.md](docs/FIRMWARE.md): Firmware architecture, partition hashes, and dual-bank safety model.
+- [docs/FIRMWARE.md](docs/FIRMWARE.md): Firmware architecture, chip ids, regular vs ANC firmware tracks, container format, and the dual-bank safety model.
 - [docs/CAPTURE_WORKFLOW.md](docs/CAPTURE_WORKFLOW.md): USB packet capture and isolation methodology.
 - [docs/NOTES.md](docs/NOTES.md): Hardware discovery log and technical observations.
 
