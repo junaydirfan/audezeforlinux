@@ -28,7 +28,16 @@ Both nodes are currently synchronized on version `v1.0.5.7.4`.
 
 ## 3. Protocol Architecture: Airoha FOTA & RACE 0x15
 
-The Audeze Maxwell and its dongle run the **Airoha (MediaTek) AB1568** System-on-Chip (SoC).
+The Audeze Maxwell and its dongle run **Airoha (MediaTek) AB15xx** System-on-Chips. The chip a package is built for is stored in TLV `0x0020`:
+
+| Chip identifier (TLV 0x0020) | Target | Live flashing |
+|---|---|---|
+| `AB1568_Dongle` | Dongle | Supported |
+| `AB1568_Headset` | Headset | Supported |
+| `AB1565_ULL2_DONGLE` | Maxwell 2 dongle | **Blocked** (dry-run only) |
+| `AB1585_Headset` | Maxwell 2 headset | **Blocked** (dry-run only) |
+
+The Maxwell 2 ids come from the official Maxwell 2 packages (v1.0.5.7.4 and the v1.0.2.60.2 rollback) published in Audeze's `maxwell-2-fw.json` list. The container format below parses and verifies on them. The RACE `0x15` FOTA block framing in section 3.1 has **not** been verified on these chips yet, so `firmware flash` refuses live writes to them until USB captures of the official updater confirm it. Packages with an unrecognised or missing chip id are also refused for live flashing.
 
 ### 3.1 Packet Framing
 While standard settings and telemetry use RACE sync byte `0x05`, Airoha's Firmware-Over-The-Air (FOTA) subsystem uses sync byte **`0x15`**:
@@ -63,7 +72,7 @@ While standard settings and telemetry use RACE sync byte `0x05`, Airoha's Firmwa
 
 ## 4. Firmware Image Container Format (Reverse-Engineered Ground Truth)
 
-Official Audeze Maxwell firmware distributions (`.bin`) encapsulate Airoha AB1568 multi-binary packages structured as follows:
+Official Audeze Maxwell firmware distributions (`.bin`) encapsulate Airoha multi-binary packages structured as follows:
 
 ```
 0x0000-0x001F : 32-byte top-level SHA-256 checksum of data[0x100:]
@@ -76,7 +85,7 @@ Official Audeze Maxwell firmware distributions (`.bin`) encapsulate Airoha AB156
 0x012E-0x0165 : TLV 0x0012 = Partition table (52 bytes: 4 count + 4 entries × 12 bytes)
                 Each entry: src_offset (LE32), decompressed_size (LE32), dst_flash_addr (LE32)
 0x0166-0x01ED : TLV 0x0014 = Per-partition SHA-256 hashes (132 bytes: 4 count + 4 × 32-byte hashes)
-0x01EE-0x01FC : TLV 0x0020 = Chip identifier ("AB1568_Headset" or "AB1568_Dongle")
+0x01EE-0x01FC : TLV 0x0020 = Chip identifier (e.g. "AB1568_Dongle", "AB1565_ULL2_DONGLE", "AB1585_Headset")
 0x0200-0x0214 : TLV 0x0021 = Design reference name ("headset_ref_design" or "dongle_ref_design")
 0x0216-0x021A : TLV 0x00F0 = Misc flag (1 byte: 0x01)
 0x021B-0x0FFF : 0xFF padding

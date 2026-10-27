@@ -281,7 +281,7 @@ class TestCommandBuildersAndParsers(unittest.TestCase):
 
         hdr = bytearray(b"\xFF" * 0x1000)
         hdr[0x100:0x10E] = struct.pack("<HHBBII", 0x0011, 10, 1, 1, 0x1000, len(comp))
-        hdr[0x10E:0x124] = struct.pack("<HH", 0x0013, 10) + b"v1.0.5.7.4\x00" + b"\xFF" * 7
+        hdr[0x10E:0x12E] = struct.pack("<HH", 0x0013, 28) + b"v1.0.5.7.4\x00" + b"\xFF" * 17
 
         pt = struct.pack("<I", 2)
         pt += struct.pack("<III", 0x1000, len(p1), 0x08013000)
@@ -302,6 +302,7 @@ class TestCommandBuildersAndParsers(unittest.TestCase):
         try:
             pkg = FirmwarePackage(t_path)
             self.assertEqual(pkg.version_string, "v1.0.5.7.4")
+            self.assertEqual(len(pkg.partitions), 2)
             self.assertTrue(pkg.outer_hash_valid)
             self.assertTrue(pkg.verify_partitions())
 
@@ -327,6 +328,67 @@ class TestCommandBuildersAndParsers(unittest.TestCase):
         finally:
             if os.path.exists(t_path):
                 os.unlink(t_path)
+
+    def _write_package(self, chip_id=None):
+        """Writes a minimal valid FOTA container, optionally with a TLV 0x0020 chip id."""
+        import tempfile, lzma
+        p1 = b"PARTITION_" * 40
+        filters = [{"id": lzma.FILTER_LZMA1, "dict_size": 16384, "lc": 3, "lp": 0, "pb": 2}]
+        comp = bytearray(lzma.compress(p1, format=lzma.FORMAT_ALONE, filters=filters))
+        comp[5:13] = struct.pack("<Q", len(p1))
+
+        hdr = bytearray(b"\xFF" * 0x1000)
+        hdr[0x100:0x10E] = struct.pack("<HHBBII", 0x0011, 10, 1, 1, 0x1000, len(comp))
+        hdr[0x10E:0x12E] = struct.pack("<HH", 0x0013, 28) + b"v1.0.5.7.4\x00" + b"\xFF" * 17
+        pt = struct.pack("<I", 1) + struct.pack("<III", 0x1000, len(p1), 0x08013000)
+        hdr[0x12E : 0x12E + 4 + len(pt)] = struct.pack("<HH", 0x0012, len(pt)) + pt
+        hashes = struct.pack("<I", 1) + hashlib.sha256(p1).digest()
+        h_off = 0x12E + 4 + len(pt)
+        hdr[h_off : h_off + 4 + len(hashes)] = struct.pack("<HH", 0x0014, len(hashes)) + hashes
+        if chip_id is not None:
+            c = chip_id.encode("ascii") + b"\x00"
+            c_off = h_off + 4 + len(hashes)
+            hdr[c_off : c_off + 4 + len(c)] = struct.pack("<HH", 0x0020, len(c)) + c
+
+        full = hdr + comp
+        full[0:32] = hashlib.sha256(full[0x100:]).digest()
+        with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as f:
+            f.write(full)
+        self.addCleanup(os.unlink, f.name)
+        return f.name
+
+    def test_fota_preflight_chip_gating(self):
+        """Maxwell 2 chips are recognised but blocked from live flashing; mismatches always fail."""
+        from maxwell2.firmware import FirmwarePackage, FotaEngine, FotaSafetyError
+
+        cases = [
+            # chip id, target, dry_run, should pass
+            ("AB1568_Dongle", "dongle", False, True),
+            ("AB1568_Headset", "headset", False, True),
+            ("AB1568_Dongle", "headset", True, False),
+            ("AB1565_ULL2_DONGLE", "dongle", True, True),
+            ("AB1565_ULL2_DONGLE", "dongle", False, False),
+            ("AB1585_Headset", "headset", True, True),
+            ("AB1585_Headset", "headset", False, False),
+            ("AB1585_Headset", "dongle", True, False),
+            ("AB9999_Mystery", "dongle", True, False),
+            (None, "dongle", True, True),
+            (None, "dongle", False, False),
+        ]
+        for chip, target, dry_run, ok in cases:
+            with self.subTest(chip=chip, target=target, dry_run=dry_run):
+                pkg = FirmwarePackage(self._write_package(chip))
+                self.assertEqual(pkg.chip_id, chip or "Unknown")
+                engine = FotaEngine(pkg, target=target, client=None, dry_run=dry_run)
+                if ok:
+                    self.assertEqual(engine.preflight_check()["chip_target"], chip or "Unknown")
+                else:
+                    with self.assertRaises(FotaSafetyError):
+                        engine.preflight_check()
+
+        info = FirmwarePackage(self._write_package("AB1585_Headset")).to_dict()
+        self.assertEqual(info["chip_target"], "headset")
+        self.assertFalse(info["live_flash_supported"])
 
 
 if __name__ == "__main__":

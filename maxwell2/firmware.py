@@ -107,16 +107,29 @@ FIRMWARE_CATALOG = {
 }
 
 
+# TLV 0x0020 chip identifiers -> (flash target, live FOTA flashing allowed).
+# AB1565_ULL2_DONGLE / AB1585_Headset are what the official Maxwell 2 packages
+# (v1.0.5.7.4 and the v1.0.2.60.2 rollback) report. The RACE 0x15 block framing in
+# FotaEngine has not been verified on those chips, so live flashing stays blocked.
+KNOWN_CHIP_IDS: Dict[str, Tuple[str, bool]] = {
+    "AB1568_Dongle": ("dongle", True),
+    "AB1568_Headset": ("headset", True),
+    "AB1565_ULL2_DONGLE": ("dongle", False),
+    "AB1585_Headset": ("headset", False),
+}
+
+
 class FirmwarePackage:
     """
-    Parses, validates, and unpacks an official Audeze / Airoha AB1568 FOTA container (.bin).
+    Parses, validates, and unpacks an official Audeze / Airoha FOTA container (.bin).
+    Seen with AB1568 chip ids and, on Maxwell 2 packages, AB1565_ULL2 (dongle) / AB1585 (headset).
     Container Layout:
       0x0000-0x001F: Top-level SHA-256 hash of bytes[0x100:]
       0x0100-0x010D: TLV 0x0011 Basic info (flags, LZMA stream start 0x1000, stream size)
       0x010E-0x0129: TLV 0x0013 Version string
       0x012E-0x0165: TLV 0x0012 Partition table (4 entries * 12 bytes)
       0x0166-0x01ED: TLV 0x0014 Per-partition SHA-256 hashes (4 * 32 bytes)
-      0x01EE-0x01FC: TLV 0x0020 Chip identifier ("AB1568_Headset" or "AB1568_Dongle")
+      0x01EE-0x01FC: TLV 0x0020 Chip identifier (see KNOWN_CHIP_IDS)
       0x0200-0x0214: TLV 0x0021 Design name
       0x1000+:       LZMA-Alone compressed stream
     """
@@ -304,6 +317,8 @@ class FirmwarePackage:
             "file_size_kb": round(self.file_size / 1024, 2),
             "version_string": self.version_string,
             "chip_id": self.chip_id,
+            "chip_target": KNOWN_CHIP_IDS.get(self.chip_id, ("unknown", False))[0],
+            "live_flash_supported": KNOWN_CHIP_IDS.get(self.chip_id, ("unknown", False))[1],
             "design_name": self.design_name,
             "outer_sha256": self.outer_hash,
             "outer_hash_valid": self.outer_hash_valid,
@@ -452,7 +467,7 @@ class FotaSafetyError(Exception):
 
 class FotaSimulator:
     """
-    Simulates the Airoha AB1568 FOTA block streaming protocol without writing to hardware.
+    Simulates the Airoha FOTA block streaming protocol (as implemented for AB1568) without writing to hardware.
     Validates chunk fragmentation, handshake packets, and transfer duration estimates.
     """
 
@@ -485,7 +500,8 @@ class FotaSimulator:
 
 class FotaEngine:
     """
-    Production-grade Airoha AB1568 FOTA streaming engine.
+    Airoha FOTA streaming engine. Live writes are only allowed for chips marked as
+    supported in KNOWN_CHIP_IDS; Maxwell 2 chips (AB1565_ULL2 / AB1585) are dry-run only.
     Performs pre-flight cryptographic partition verification, battery checks,
     and streams 56-byte firmware blocks with dual-bank recovery safety.
     """
@@ -511,7 +527,8 @@ class FotaEngine:
         Validates all safety prerequisites:
         1. Package outer SHA-256 integrity.
         2. All 4 internal partition SHA-256 hashes.
-        3. Chip ID match ("AB1568_Dongle" vs "AB1568_Headset").
+        3. Chip ID is known (KNOWN_CHIP_IDS) and built for the selected target.
+           Live flashing additionally requires a chip whose FOTA framing is verified.
         4. Battery level >= 50% (if flashing headset or querying client).
         """
         # 1. Package integrity
@@ -522,12 +539,25 @@ class FotaEngine:
             raise FotaSafetyError("One or more firmware partition SHA-256 hashes failed verification.")
 
         # 2. Chip Target Check
-        expected_chip = "AB1568_Dongle" if self.target == "dongle" else "AB1568_Headset"
         actual_chip = self.package.chip_id
-        if actual_chip != "Unknown" and actual_chip != expected_chip:
-            raise FotaSafetyError(
-                f"Target mismatch: Attempting to flash {self.target.upper()} with package compiled for {actual_chip}!"
-            )
+        chip_info = KNOWN_CHIP_IDS.get(actual_chip)
+        if chip_info is None:
+            # A package without a chip TLV can still be simulated, never written.
+            if actual_chip != "Unknown" or not self.dry_run:
+                raise FotaSafetyError(
+                    f"Unrecognised chip identifier '{actual_chip}': refusing to flash an unknown target."
+                )
+        else:
+            chip_target, live_supported = chip_info
+            if chip_target != self.target:
+                raise FotaSafetyError(
+                    f"Target mismatch: Attempting to flash {self.target.upper()} with package compiled for {actual_chip}!"
+                )
+            if not live_supported and not self.dry_run:
+                raise FotaSafetyError(
+                    f"Live flashing of {actual_chip} (Maxwell 2) is not supported yet: the FOTA packet framing "
+                    "has not been verified on this chip. Use --dry-run to simulate the transfer."
+                )
 
         # 3. Battery check if client is available
         batt_pct = None
@@ -718,6 +748,8 @@ def format_firmware_inspect_plain(info: Dict[str, Any]) -> str:
     lines.append(f"│  File Size                 : {info.get('file_size_kb', 0)} KB ({info.get('file_size_bytes', 0)} bytes)             │")
     lines.append(f"│  Embedded Firmware Version : {info.get('version_string', 'Unknown'):<38} │")
     lines.append(f"│  Target Chip Identifier    : {info.get('chip_id', 'Unknown'):<38} │")
+    flash_s = "Supported" if info.get("live_flash_supported") else "Not supported (dry-run only)"
+    lines.append(f"│  Live Flash Support        : {flash_s:<38} │")
     lines.append(f"│  Reference Design Name     : {info.get('design_name', 'Unknown'):<38} │")
 
     outer_v = "VALID (Pass)" if info.get("outer_hash_valid") else "INVALID (Tampered/Corrupted)"
