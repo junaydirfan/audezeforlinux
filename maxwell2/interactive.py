@@ -558,7 +558,7 @@ class CursesTUI:
         safe_addstr(self.stdscr, start_y + 2, 4, f"Wireless Headset Firmware : {h_fw:<24} [Operational]", self.C_NORMAL)
         safe_addstr(self.stdscr, start_y + 3, 4, f"Version Parity Check      : {p_str}", self.C_NORMAL)
         safe_addstr(self.stdscr, start_y + 4, 4, f"Headset Battery Level     : {b_str}", self.C_NORMAL)
-        safe_addstr(self.stdscr, start_y + 5, 4, f"Flash Protection Model    : Airoha AB1568 Dual-Bank (Inactive Bank B Fallback)", self.C_NORMAL)
+        safe_addstr(self.stdscr, start_y + 5, 4, f"Live Flashing             : Disabled (FOTA protocol not yet verified)", self.C_NORMAL)
         safe_addstr(self.stdscr, start_y + 6, 2, "└" + "─" * (box_w - 2) + "┘", self.C_DIM)
 
         # Middle Box: Official Changelog Browser
@@ -793,7 +793,7 @@ class CursesTUI:
                 self.fw_target = "headset" if self.fw_target == "dongle" else "dongle"
                 self.message = f"Target Node toggled to: {self.fw_target.upper()}"
             elif ch in (ord('f'), ord('F')):
-                self.message = "Run physical flash from shell: ./audezeforlinux firmware flash <file.bin> --confirm-risk"
+                self.message = "Live flashing is disabled until verified. Simulate: ./audezeforlinux firmware flash <file.bin> --dry-run"
             elif ch in (ord('c'), ord('C')):
                 self.message = "Firmware is verified up to date with official release v1.0.5.7.4."
 

@@ -124,6 +124,36 @@ Downloaded copies (scratch, not in repo): `/tmp/claude-1000/-home-junaids--claud
 - dongle sha256 `b16ecc9793d6ab9530dc45805cc486061f302fa389e9215f66d81fb587571a39`
 - headset sha256 `2d5149fc5859c8c437b83fe2d4b83b8068ab9d9038ae61704c73640be90c6f9a`
 
+## Flash hardening (2026-10-26)
+
+Found during review:
+- The live write path had never worked. `execute()` called `write_race_packet(..., target_route=...)`,
+  a parameter that doesn't exist, so it crashed with a TypeError before the first chunk. Nothing was
+  ever written to a device.
+- The route was inverted: `--target dongle` mapped to 0x80, which is the headset relay. Correct
+  mapping: through a dongle, 0x00 = dongle and 0x80 = headset; over USB-C, 0x00 = headset.
+
+Changes:
+- `KNOWN_CHIP_IDS`: live flashing is now blocked for **all** chips, AB1568 included.
+- `Transport.write_race_packet(packet, is_dongle=None)` takes a per-packet route override.
+- `FotaEngine` fails closed on live runs. It refuses if any of these can't be confirmed: connection,
+  route (dongle target over USB-C), installed version (read per target), strict device track,
+  package track match, downgrade (needs `allow_downgrade`), headset battery (None, error or <50%).
+- Ctrl-C → `FotaInterruptedError`, write error → `FotaTransferError`. Both record `chunks_sent` and
+  say not to unplug. A cancel before the first chunk says nothing was written.
+- Post-flash readback polls the target version: `confirmed`, `version_mismatch` or `no_response`.
+  `success` is only true when confirmed.
+- CLI: preflight runs before the CONFIRM prompt; new `--allow-downgrade` flag plus a typed
+  `DOWNGRADE` prompt; clean errors; exit codes 1 = refused, 3 = transfer stopped, 4 = not verified.
+- Tests: `FakeFotaTransport` / `FakeFotaClient` harness, `TestFotaLiveHarness` (live path enabled via
+  `mock.patch.dict` inside each test) and `TestFotaBlockedByDefault`. 24 tests pass. Putting the old
+  `target_route` call back breaks 5 tests.
+- Not done on purpose: no start/commit commands and no ACK reading. Those come from USB captures.
+- Not fixed: the interactive dashboard's `c` key still shows a hard-coded "up to date with v1.0.5.7.4"
+  message, which is wrong for ANC and older units.
+- Note: the user's Maxwell 2 Xbox dongle (3329:4B28) was connected while testing. One `--confirm-risk`
+  CLI run opened it but was refused at the first live check, before any read or write.
+
 ## Plan / status
 
 - [ ] **Merge the version-tuple PR** (recommended; not done yet as of these notes).

@@ -329,7 +329,7 @@ class TestCommandBuildersAndParsers(unittest.TestCase):
             if os.path.exists(t_path):
                 os.unlink(t_path)
 
-    def _write_package(self, chip_id=None, name=None):
+    def _write_package(self, chip_id=None, name=None, version="v1.0.5.7.4"):
         """Writes a minimal valid FOTA container, optionally with a TLV 0x0020 chip id."""
         import tempfile, lzma
         p1 = b"PARTITION_" * 40
@@ -339,7 +339,8 @@ class TestCommandBuildersAndParsers(unittest.TestCase):
 
         hdr = bytearray(b"\xFF" * 0x1000)
         hdr[0x100:0x10E] = struct.pack("<HHBBII", 0x0011, 10, 1, 1, 0x1000, len(comp))
-        hdr[0x10E:0x12E] = struct.pack("<HH", 0x0013, 28) + b"v1.0.5.7.4\x00" + b"\xFF" * 17
+        ver = version.encode("ascii") + b"\x00"
+        hdr[0x10E:0x12E] = struct.pack("<HH", 0x0013, 28) + ver + b"\xFF" * (28 - len(ver))
         pt = struct.pack("<I", 1) + struct.pack("<III", 0x1000, len(p1), 0x08013000)
         hdr[0x12E : 0x12E + 4 + len(pt)] = struct.pack("<HH", 0x0012, len(pt)) + pt
         hashes = struct.pack("<I", 1) + hashlib.sha256(p1).digest()
@@ -371,8 +372,10 @@ class TestCommandBuildersAndParsers(unittest.TestCase):
 
         cases = [
             # chip id, target, dry_run, should pass
-            ("AB1568_Dongle", "dongle", False, True),
-            ("AB1568_Headset", "headset", False, True),
+            # Live flashing is blocked for every chip until the protocol is verified.
+            ("AB1568_Dongle", "dongle", True, True),
+            ("AB1568_Dongle", "dongle", False, False),
+            ("AB1568_Headset", "headset", False, False),
             ("AB1568_Dongle", "headset", True, False),
             ("AB1565_ULL2_DONGLE", "dongle", True, True),
             ("AB1565_ULL2_DONGLE", "dongle", False, False),
@@ -442,7 +445,7 @@ class TestCommandBuildersAndParsers(unittest.TestCase):
             (anc, "maxwell2", True, "track mismatch"),
             (anc, "maxwell2_anc", True, None),
             (anc, None, True, None),
-            (anc, None, False, "regular or ANC"),
+            (anc, None, False, "not supported yet"),
             (anc, "maxwell2_anc", False, "not supported yet"),
         ]
         for pkg, device_track, dry_run, err in cases:
@@ -453,6 +456,188 @@ class TestCommandBuildersAndParsers(unittest.TestCase):
                 else:
                     with self.assertRaisesRegex(FotaSafetyError, err):
                         engine.preflight_check()
+
+
+
+class FakeFotaTransport:
+    """Stands in for Transport on the live flash path: records writes, can fail or be interrupted."""
+
+    def __init__(self, is_dongle=True, fail_at=None, interrupt_at=None):
+        self.dry_run = False
+        self.is_dongle = is_dongle
+        self.fail_at = fail_at
+        self.interrupt_at = interrupt_at
+        self.writes = []  # (packet, is_dongle route flag)
+
+    def write_race_packet(self, race_packet, is_dongle=None):
+        if len(self.writes) == self.interrupt_at:
+            raise KeyboardInterrupt
+        if len(self.writes) == self.fail_at:
+            raise OSError("Broken pipe")
+        self.writes.append((race_packet, self.is_dongle if is_dongle is None else is_dongle))
+        return []
+
+
+class FakeFotaClient:
+    """Stands in for MaxwellClient: serves battery and per-node versions, switching version after the transfer."""
+
+    def __init__(self, transport, total_chunks=None, versions=None, after=None, battery=85, battery_error=None,
+                 version_error=None):
+        self.transport = transport
+        self.total_chunks = total_chunks
+        self.versions = versions or {"dongle": "v1.0.2.60.2", "headset": "v1.0.2.60.2"}
+        self.after = after
+        self.battery = battery
+        self.battery_error = battery_error
+        self.version_error = version_error
+
+    def get_battery(self):
+        if self.battery_error:
+            raise self.battery_error
+        return self.battery
+
+    def get_firmware(self):
+        if self.version_error:
+            raise self.version_error
+        done = self.total_chunks is not None and len(self.transport.writes) >= self.total_chunks
+        return dict(self.after) if (done and self.after) else dict(self.versions)
+
+
+class TestFotaBlockedByDefault(unittest.TestCase):
+    """Without the test-only patch, no chip may be flashed live, even with a healthy device."""
+
+    def test_no_chip_allows_live_flashing(self):
+        from maxwell2.firmware import KNOWN_CHIP_IDS, FirmwarePackage, FotaEngine, FotaSafetyError
+        self.assertFalse(any(live for _, live in KNOWN_CHIP_IDS.values()))
+        pkg = FirmwarePackage(TestCommandBuildersAndParsers._write_package(self, "AB1585_Headset",
+                                                                           "Maxwell2_PS_headset_v1.0.5.7.4.bin"))
+        transport = FakeFotaTransport()
+        engine = FotaEngine(pkg, target="headset", client=FakeFotaClient(transport), dry_run=False)
+        with self.assertRaisesRegex(FotaSafetyError, "not supported yet"):
+            engine.execute()
+        self.assertEqual(transport.writes, [])
+
+
+class TestFotaLiveHarness(unittest.TestCase):
+    """Exercises the live flash path against a fake device, with live writes enabled only inside each test."""
+
+    def setUp(self):
+        from unittest import mock
+        from maxwell2 import firmware
+        patcher = mock.patch.dict(firmware.KNOWN_CHIP_IDS, {
+            "AB1565_ULL2_DONGLE": ("dongle", True),
+            "AB1585_Headset": ("headset", True),
+        })
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    _write_package = TestCommandBuildersAndParsers._write_package
+
+    def _engine(self, target="headset", version="v1.0.5.7.4", transport=None, after="match", **client_kw):
+        from maxwell2.firmware import FirmwarePackage, FotaEngine
+        chip = "AB1585_Headset" if target == "headset" else "AB1565_ULL2_DONGLE"
+        pkg = FirmwarePackage(self._write_package(chip, f"Maxwell2_PS_{target}_{version}.bin", version))
+        transport = transport or FakeFotaTransport()
+        total = (pkg.file_size + 55) // 56
+        if after == "match":
+            after = {"dongle": version, "headset": version}
+        client = FakeFotaClient(transport, total_chunks=total, after=after, **client_kw)
+        engine = FotaEngine(pkg, target=target, client=client, dry_run=False, readback_timeout_sec=0)
+        return engine, transport
+
+    def test_routes_per_target(self):
+        from maxwell2.firmware import FotaSafetyError
+        # Through a dongle: dongle is route 0x00, headset is relayed on 0x80.
+        engine, t = self._engine("dongle", transport=FakeFotaTransport(is_dongle=True))
+        self.assertTrue(engine.execute()["success"])
+        self.assertEqual({flag for _, flag in t.writes}, {False})
+        engine, t = self._engine("headset", transport=FakeFotaTransport(is_dongle=True))
+        engine.execute()
+        self.assertEqual({flag for _, flag in t.writes}, {True})
+        # Direct USB-C: the headset is route 0x00, and there is no dongle to flash.
+        engine, t = self._engine("headset", transport=FakeFotaTransport(is_dongle=False))
+        engine.execute()
+        self.assertEqual({flag for _, flag in t.writes}, {False})
+        engine, t = self._engine("dongle", transport=FakeFotaTransport(is_dongle=False))
+        with self.assertRaisesRegex(FotaSafetyError, "not a dongle"):
+            engine.execute()
+        self.assertEqual(t.writes, [])
+
+    def test_streams_whole_package_in_order(self):
+        engine, t = self._engine()
+        engine.execute()
+        payload = b"".join(pkt[6:] for pkt, _ in t.writes)
+        self.assertEqual(payload, bytes(engine.package.raw_data))
+        self.assertTrue(all(pkt[:2] == b"\x15\x5a" for pkt, _ in t.writes))
+
+    def test_fails_closed_on_unreadable_device_state(self):
+        from maxwell2.firmware import FotaSafetyError
+        cases = [
+            ("battery None", dict(battery=None), "battery"),
+            ("battery error", dict(battery_error=OSError("timeout")), "battery"),
+            ("battery low", dict(battery=30), "30%"),
+            ("version unknown", dict(versions={"dongle": "Unknown", "headset": "Unknown"}), "version"),
+            ("version error", dict(version_error=OSError("timeout")), "version"),
+            ("unknown release", dict(versions={"dongle": "v1.0.5.9", "headset": "v1.0.5.9"}), "not a known release"),
+            ("ANC device", dict(versions={"dongle": "v1.0.5.6", "headset": "v1.0.5.6"}), "track mismatch"),
+        ]
+        for name, kw, err in cases:
+            with self.subTest(name):
+                engine, t = self._engine(**kw)
+                with self.assertRaisesRegex(FotaSafetyError, err):
+                    engine.execute()
+                self.assertEqual(t.writes, [])
+
+        from maxwell2.firmware import FirmwarePackage, FotaEngine
+        pkg = FirmwarePackage(self._write_package("AB1585_Headset", "Maxwell2_PS_headset_v1.0.5.7.4.bin"))
+        for client in (None, FakeFotaClient(type("T", (), {"dry_run": True, "is_dongle": True})())):
+            with self.subTest(client=client):
+                with self.assertRaisesRegex(FotaSafetyError, "device connection|dry-run"):
+                    FotaEngine(pkg, target="headset", client=client, dry_run=False).preflight_check()
+
+    def test_downgrade_needs_confirmation(self):
+        from maxwell2.firmware import FotaSafetyError
+        newer = {"dongle": "v1.0.5.7.4", "headset": "v1.0.5.7.4"}
+        engine, t = self._engine(version="v1.0.2.60.2", versions=newer)
+        with self.assertRaisesRegex(FotaSafetyError, "OLDER"):
+            engine.execute()
+        self.assertEqual(t.writes, [])
+        engine, t = self._engine(version="v1.0.2.60.2", versions=newer)
+        engine.allow_downgrade = True
+        self.assertTrue(engine.preflight_check()["is_downgrade"])
+        self.assertTrue(engine.execute()["success"])
+
+    def test_interrupt_and_write_failure(self):
+        from maxwell2.firmware import FotaInterruptedError, FotaTransferError
+        engine, _ = self._engine(transport=FakeFotaTransport(interrupt_at=5))
+        with self.assertRaises(FotaInterruptedError) as cm:
+            engine.execute()
+        self.assertEqual(cm.exception.chunks_sent, 5)
+        self.assertIn("Do NOT unplug", str(cm.exception))
+
+        engine, _ = self._engine(transport=FakeFotaTransport(interrupt_at=0))
+        with self.assertRaisesRegex(FotaInterruptedError, "nothing was written"):
+            engine.execute()
+
+        engine, _ = self._engine(transport=FakeFotaTransport(fail_at=3))
+        with self.assertRaises(FotaTransferError) as cm:
+            engine.execute()
+        self.assertNotIsInstance(cm.exception, FotaInterruptedError)
+        self.assertEqual(cm.exception.chunks_sent, 3)
+        self.assertIn("Broken pipe", str(cm.exception))
+
+    def test_post_flash_readback(self):
+        res = self._engine()[0].execute()
+        self.assertEqual((res["success"], res["verification"]), (True, "confirmed"))
+
+        stale = {"dongle": "v1.0.2.60.2", "headset": "v1.0.2.60.2"}
+        res = self._engine(after=stale)[0].execute()
+        self.assertEqual((res["success"], res["verification"]), (False, "version_mismatch"))
+        self.assertEqual(res["reported_version"], "v1.0.2.60.2")
+
+        gone = {"dongle": "Unknown", "headset": "Unknown"}
+        res = self._engine(after=gone)[0].execute()
+        self.assertEqual((res["success"], res["verification"]), (False, "no_response"))
 
 
 if __name__ == "__main__":

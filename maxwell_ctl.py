@@ -156,11 +156,12 @@ def main():
     fw_inspect.add_argument("file", help="Path to firmware .bin file to inspect")
     fw_unpack = fw_sub.add_parser("unpack", help="Decompress and extract firmware partitions to directory")
     fw_unpack.add_argument("file", help="Path to firmware .bin file to unpack")
-    fw_flash = fw_sub.add_parser("flash", help="Stream firmware update to target node with dual-bank protection")
+    fw_flash = fw_sub.add_parser("flash", help="Simulate a firmware update (live flashing is refused until the FOTA protocol is verified)")
     fw_flash.add_argument("file", help="Path to firmware .bin file to flash")
     fw_flash.add_argument("--target", choices=["dongle", "headset"], default="dongle", help="Target node")
     fw_flash.add_argument("--confirm-risk", action="store_true", help="Explicit confirmation gate for real hardware flashing")
     fw_flash.add_argument("--dry-run", action="store_true", help="Simulate FOTA flash without transmitting live hardware writes")
+    fw_flash.add_argument("--allow-downgrade", action="store_true", help="Permit flashing a package older than the installed firmware")
 
     # 9. system utilities (doctor, setup-udev, install-system)
     subparsers.add_parser("doctor", help="Run comprehensive Linux audio environment and permissions diagnostics")
@@ -264,44 +265,67 @@ def main():
             return
 
         elif args.firmware_action == "flash":
-            from maxwell2.firmware import FirmwarePackage, FotaEngine, FotaSafetyError
+            from maxwell2.firmware import FirmwarePackage, FotaEngine, FotaSafetyError, FotaTransferError
             pkg = FirmwarePackage(args.file)
             is_dry = args.dry_run or not args.confirm_risk
 
-            if not is_dry:
-                print("⚠ WARNING: You are about to flash physical hardware.")
-                print("           Do NOT unplug the USB cable or power off the headset during flashing.")
-                confirm = input("Type 'CONFIRM' to proceed: ").strip()
-                if confirm != "CONFIRM":
-                    print("[-] Flash aborted by user.")
-                    return
+            try:
+                transport = Transport(hidraw_path=args.device, dry_run=is_dry)
+                with transport:
+                    client = MaxwellClient(transport)
+                    engine = FotaEngine(
+                        pkg, target=args.target, client=client, dry_run=is_dry, allow_downgrade=args.allow_downgrade
+                    )
 
-            transport = Transport(hidraw_path=args.device, dry_run=is_dry)
-            with transport:
-                client = MaxwellClient(transport)
-                device_track = None
-                if not is_dry:
-                    from maxwell2.firmware import detect_device_track
-                    try:
-                        device_track = detect_device_track(client.get_firmware().get("firmware", ""), strict=True)
-                    except Exception:
-                        pass
-                engine = FotaEngine(pkg, target=args.target, client=client, dry_run=is_dry, device_track=device_track)
+                    # Run every safety check before asking for confirmation.
+                    pre = engine.preflight_check()
 
-                print(f"[*] Starting FOTA Flash {'(DRY RUN)' if is_dry else '(LIVE HARDWARE)'}:")
-                print(f"    File: {pkg.filename} (Version: {pkg.version_string})")
-                print(f"    Target Node: {args.target.upper()} • Total Chunks: {engine.total_chunks}")
+                    if not is_dry:
+                        print("⚠ WARNING: You are about to flash physical hardware.")
+                        print("           Do NOT unplug the USB cable or power off the headset during flashing.")
+                        print(f"           {args.target.upper()}: {pre['installed_version']} -> {pkg.version_string}")
+                        word = "CONFIRM"
+                        if pre["is_downgrade"]:
+                            print("⚠ This is a DOWNGRADE to an older firmware version.")
+                            word = "DOWNGRADE"
+                        try:
+                            confirm = input(f"Type '{word}' to proceed: ").strip()
+                        except (KeyboardInterrupt, EOFError):
+                            confirm = ""
+                        if confirm != word:
+                            print("\n[-] Flash aborted by user. Nothing was written.")
+                            return
 
-                def progress(p):
-                    pct = p['percent']
-                    bar = "█" * (pct // 4) + "░" * (25 - pct // 4)
-                    sys.stdout.write(f"\r    [{bar}] {pct:3d}% ({p['current_chunk']}/{p['total_chunks']}) - {p['speed_kb_s']} KB/s - ETA: {p['eta_sec']}s  ")
-                    sys.stdout.flush()
+                    print(f"[*] Starting FOTA Flash {'(DRY RUN)' if is_dry else '(LIVE HARDWARE)'}:")
+                    print(f"    File: {pkg.filename} (Version: {pkg.version_string})")
+                    print(f"    Target Node: {args.target.upper()} • Total Chunks: {engine.total_chunks}")
 
-                res = engine.execute(progress_callback=progress)
-                print(f"\n✔ FOTA Flash complete in {res['duration_sec']}s ({res['chunks_sent']} chunks transferred).")
-                if is_dry:
-                    print("  Note: Dry-run simulation completed. No hardware flash bytes were modified.")
+                    def progress(p):
+                        pct = p['percent']
+                        bar = "█" * (pct // 4) + "░" * (25 - pct // 4)
+                        sys.stdout.write(f"\r    [{bar}] {pct:3d}% ({p['current_chunk']}/{p['total_chunks']}) - {p['speed_kb_s']} KB/s - ETA: {p['eta_sec']}s  ")
+                        sys.stdout.flush()
+
+                    res = engine.execute(progress_callback=progress)
+            except FotaTransferError as e:
+                print(f"\n✖ {e}")
+                sys.exit(3)
+            except FotaSafetyError as e:
+                print(f"[-] Flash refused: {e}")
+                sys.exit(1)
+            except (DeviceNotFoundError, DevicePermissionError) as e:
+                print(f"[-] {e}")
+                sys.exit(1)
+
+            print(f"\n✔ FOTA transfer finished in {res['duration_sec']}s ({res['chunks_sent']} chunks transferred).")
+            if is_dry:
+                print("  Note: Dry-run simulation completed. No hardware flash bytes were modified.")
+            elif res["verification"] == "confirmed":
+                print(f"  ✔ {args.target.capitalize()} now reports {res['reported_version']}.")
+            else:
+                print(f"  ✖ Could not confirm the update: {args.target} reports {res['reported_version']} "
+                      f"(expected {pkg.version_string}). Run 'firmware status' once the device has reconnected.")
+                sys.exit(4)
             return
 
     # Initialize transport and client

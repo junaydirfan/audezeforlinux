@@ -212,12 +212,14 @@ class Transport:
             time.sleep(0.012)
             self.poll_input_report()
 
-    def write_race_packet(self, race_packet: bytes) -> List[bytes]:
+    def write_race_packet(self, race_packet: bytes, is_dongle: Optional[bool] = None) -> List[bytes]:
         """
         Frames and transmits a RACE packet over HID output reports (Report ID 0x06).
+        is_dongle overrides the route for this packet only (True = 0x80 relay, False = 0x00).
         In dry-run mode, prints the outgoing report bytes and returns them.
         """
-        reports = frame_output_reports(race_packet, is_dongle=self.is_dongle)
+        route_flag = self.is_dongle if is_dongle is None else is_dongle
+        reports = frame_output_reports(race_packet, is_dongle=route_flag)
 
         if self.dry_run:
             print(f"[DRY-RUN] Sending RACE packet ({len(race_packet)} bytes):")

@@ -59,7 +59,7 @@ A true DAW-style horizontal graphic EQ (32 Hz to 16 kHz). Tune in precision ±0.
 ### Firmware Diagnostics & Pre-Flight Flasher
 Live dual-node telemetry monitoring Dongle & Headset version parity, battery safety reserve (>= 50%), and transport routes. Browse the complete official Maxwell 2 changelog (`v1.0.5.7.4` to `v1.0.2.49`) with keyboard scrolling, and inspect and verify official firmware packages, including the separate **Maxwell 2 ANC** firmware track.
 
-> **Maxwell 2 flashing is dry-run only for now.** Maxwell 2 firmware targets the Airoha AB1565_ULL2 (dongle) and AB1585 (headset) chips. The FOTA transfer has not been verified on these chips, so live flashing is refused until USB captures of the official updater confirm it. Regular and ANC Maxwell 2 firmware use the same chips but are not interchangeable: the tool refuses to flash or recommend firmware from the wrong track.
+> **Firmware flashing is dry-run only for now.** Maxwell 2 firmware targets the Airoha AB1565_ULL2 (dongle) and AB1585 (headset) chips. The FOTA transfer hasn't been verified against the official updater on any chip, so live flashing is refused until USB captures confirm it. When it is enabled, flashing will fail closed: it refuses unless the version, firmware track, route and battery can all be read, asks for extra confirmation on downgrades, and reads the version back afterwards. Regular and ANC Maxwell 2 firmware use the same chips but are not interchangeable: the tool refuses to flash or recommend firmware from the wrong track.
 
 **Keybindings:** `↑`/`↓` scroll changelog · `r` refresh telemetry
 
@@ -180,7 +180,7 @@ audezeforlinux firmware check --package path/to/maxwell_firmware.bin
 # Inspect an official .bin firmware package (chip id, firmware track, SHA-256 partition verification)
 audezeforlinux firmware inspect path/to/maxwell_firmware.bin
 
-# Simulate a firmware update (Maxwell 2 packages are dry-run only for now)
+# Simulate a firmware update (live flashing is refused for now; see docs/FIRMWARE.md)
 audezeforlinux firmware flash path/to/maxwell_firmware.bin --target dongle --dry-run
 ```
 

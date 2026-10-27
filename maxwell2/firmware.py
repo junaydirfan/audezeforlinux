@@ -19,8 +19,6 @@ from maxwell2.protocol import (
     build_firmware_command,
     parse_firmware_notification,
     CMD_FIRMWARE,
-    ROUTE_DONGLE,
-    ROUTE_DIRECT,
 )
 
 
@@ -125,10 +123,11 @@ FIRMWARE_CATALOG = {
 # TLV 0x0020 chip identifiers -> (flash target, live FOTA flashing allowed).
 # AB1565_ULL2_DONGLE / AB1585_Headset are what the official Maxwell 2 packages
 # (v1.0.5.7.4 and the v1.0.2.60.2 rollback) report. The RACE 0x15 block framing in
-# FotaEngine has not been verified on those chips, so live flashing stays blocked.
+# FotaEngine has not been checked against captures of the official updater on any chip,
+# so live flashing is blocked for all of them until it is.
 KNOWN_CHIP_IDS: Dict[str, Tuple[str, bool]] = {
-    "AB1568_Dongle": ("dongle", True),
-    "AB1568_Headset": ("headset", True),
+    "AB1568_Dongle": ("dongle", False),
+    "AB1568_Headset": ("headset", False),
     "AB1565_ULL2_DONGLE": ("dongle", False),
     "AB1585_Headset": ("headset", False),
 }
@@ -542,6 +541,23 @@ class FotaSafetyError(Exception):
     pass
 
 
+class FotaTransferError(FotaSafetyError):
+    """Raised when a live transfer stops part-way. Records how far it got."""
+
+    def __init__(self, message: str, chunks_sent: int, total_chunks: int):
+        super().__init__(message)
+        self.chunks_sent = chunks_sent
+        self.total_chunks = total_chunks
+
+
+class FotaInterruptedError(FotaTransferError):
+    """Raised when the user cancels (Ctrl-C) a transfer part-way."""
+    pass
+
+
+MIN_HEADSET_BATTERY_PCT = 50
+
+
 class FotaSimulator:
     """
     Simulates the Airoha FOTA block streaming protocol (as implemented for AB1568) without writing to hardware.
@@ -578,9 +594,12 @@ class FotaSimulator:
 class FotaEngine:
     """
     Airoha FOTA streaming engine. Live writes are only allowed for chips marked as
-    supported in KNOWN_CHIP_IDS; Maxwell 2 chips (AB1565_ULL2 / AB1585) are dry-run only.
-    Performs pre-flight cryptographic partition verification, battery checks,
-    and streams 56-byte firmware blocks with dual-bank recovery safety.
+    supported in KNOWN_CHIP_IDS, which is currently none: the block framing has not been
+    verified against the official updater. Dry runs exercise everything except the writes.
+
+    Live flashing fails closed: every device fact it depends on (connection, route,
+    installed version, firmware track, headset battery) must be read successfully, or
+    preflight refuses. After streaming, the target's version is read back.
     """
 
     def __init__(
@@ -590,17 +609,51 @@ class FotaEngine:
         client: Optional[MaxwellClient] = None,
         dry_run: bool = True,
         device_track: Optional[str] = None,
+        installed_version: Optional[str] = None,
+        allow_downgrade: bool = False,
+        readback_timeout_sec: float = 60.0,
+        readback_interval_sec: float = 2.0,
     ):
         self.package = package
         self.target = target.lower()
         self.client = client
         # Catalog track of the connected device (see detect_device_track), None if unknown.
         self.device_track = device_track
+        # Firmware version currently on the target node; read from the device if None.
+        self.installed_version = installed_version
+        self.allow_downgrade = allow_downgrade
         self.dry_run = dry_run
+        self.readback_timeout_sec = readback_timeout_sec
+        self.readback_interval_sec = readback_interval_sec
         self.chunk_size = 56
         self.total_bytes = package.file_size
         self.total_chunks = (self.total_bytes + self.chunk_size - 1) // self.chunk_size
         self.cancelled = False
+
+    def _live_transport(self):
+        if self.client is None or getattr(self.client, "transport", None) is None:
+            raise FotaSafetyError("No device connection: live flashing needs a connected Maxwell.")
+        transport = self.client.transport
+        if transport.dry_run:
+            raise FotaSafetyError("Transport is in dry-run mode: refusing a live flash over a simulated connection.")
+        return transport
+
+    def _relay_via_dongle(self) -> bool:
+        """
+        Route for the target, mirroring MaxwellClient.get_firmware(): through a dongle,
+        route 0x00 reaches the dongle and 0x80 is relayed to the headset; over direct
+        USB-C, route 0x00 is the headset itself.
+        """
+        connected_via_dongle = self._live_transport().is_dongle
+        if self.target == "dongle":
+            if not connected_via_dongle:
+                raise FotaSafetyError("Target is the DONGLE, but the connected device is not a dongle.")
+            return False
+        return connected_via_dongle
+
+    def _read_target_version(self) -> str:
+        fw = self.client.get_firmware()
+        return str(fw.get(self.target, "Unknown")).strip() or "Unknown"
 
     def preflight_check(self) -> Dict[str, Any]:
         """
@@ -610,7 +663,9 @@ class FotaEngine:
         3. Chip ID is known (KNOWN_CHIP_IDS) and built for the selected target.
            The package's firmware track (e.g. regular vs ANC Maxwell 2) must match the device's.
            Live flashing additionally requires a chip whose FOTA framing is verified.
-        4. Battery level >= 50% (if flashing headset or querying client).
+        4. Live only: connected device and route, installed version, firmware track,
+           downgrade confirmation, and headset battery >= 50%. Any of these that cannot
+           be read is a refusal, not a pass.
         """
         # 1. Package integrity
         if not self.package.outer_hash_valid:
@@ -621,6 +676,7 @@ class FotaEngine:
 
         # 2. Chip Target Check
         actual_chip = self.package.chip_id
+        pkg_track = self.package.firmware_track
         chip_info = KNOWN_CHIP_IDS.get(actual_chip)
         if chip_info is None:
             # A package without a chip TLV can still be simulated, never written.
@@ -628,110 +684,203 @@ class FotaEngine:
                 raise FotaSafetyError(
                     f"Unrecognised chip identifier '{actual_chip}': refusing to flash an unknown target."
                 )
+            live_supported = False
         else:
             chip_target, live_supported = chip_info
             if chip_target != self.target:
                 raise FotaSafetyError(
                     f"Target mismatch: Attempting to flash {self.target.upper()} with package compiled for {actual_chip}!"
                 )
-            pkg_track = self.package.firmware_track
-            if self.device_track and pkg_track != "unknown" and pkg_track != self.device_track:
+
+        if self.device_track and pkg_track != "unknown" and pkg_track != self.device_track:
+            raise FotaSafetyError(
+                f"Firmware track mismatch: package is {pkg_track} firmware but the device is on the "
+                f"{self.device_track} track. Regular and ANC Maxwell 2 firmware are not interchangeable."
+            )
+
+        installed = self.installed_version
+        is_downgrade = bool(installed) and parse_version_tuple(self.package.version_string) < parse_version_tuple(installed)
+        batt_pct = None
+        relay = None
+
+        if not self.dry_run:
+            if not live_supported:
                 raise FotaSafetyError(
-                    f"Firmware track mismatch: package is {pkg_track} firmware but the device is on the "
-                    f"{self.device_track} track. Regular and ANC Maxwell 2 firmware are not interchangeable."
-                )
-            if actual_chip in MAXWELL2_CHIP_IDS and not self.dry_run and not self.device_track:
-                raise FotaSafetyError(
-                    f"Cannot confirm whether the device is a regular or ANC Maxwell 2 ({actual_chip} is used by both): "
-                    "refusing to flash without a known device firmware track."
-                )
-            if not live_supported and not self.dry_run:
-                raise FotaSafetyError(
-                    f"Live flashing of {actual_chip} (Maxwell 2) is not supported yet: the FOTA packet framing "
-                    "has not been verified on this chip. Use --dry-run to simulate the transfer."
+                    f"Live flashing of {actual_chip} is not supported yet: the FOTA packet framing has not been "
+                    "verified against the official updater on this chip. Use --dry-run to simulate the transfer."
                 )
 
-        # 3. Battery check if client is available
-        batt_pct = None
-        if self.client and not self.client.transport.dry_run:
-            try:
-                batt_pct = self.client.get_battery()
-                if batt_pct is not None and batt_pct < 50 and self.target == "headset":
-                    raise FotaSafetyError(f"Headset battery is {batt_pct}%. Minimum 50% required for flashing safety.")
-            except Exception as e:
-                if isinstance(e, FotaSafetyError):
-                    raise
+            # 3. Device connection and route
+            relay = self._relay_via_dongle()
+
+            # 4. Installed version and firmware track
+            if not installed:
+                try:
+                    installed = self._read_target_version()
+                except Exception as e:
+                    raise FotaSafetyError(f"Could not read the {self.target} firmware version: {e}")
+            if installed == "Unknown" or parse_version_tuple(installed) == (0,):
+                raise FotaSafetyError(f"Could not read the {self.target} firmware version: refusing to flash blind.")
+            self.installed_version = installed
+
+            if not self.device_track:
+                self.device_track = detect_device_track(installed, strict=True)
+            if not self.device_track:
+                raise FotaSafetyError(
+                    f"Installed version {installed} is not a known release, so the device's firmware track "
+                    "(e.g. regular vs ANC Maxwell 2) cannot be confirmed: refusing to flash."
+                )
+            if pkg_track == "unknown" or pkg_track != self.device_track:
+                raise FotaSafetyError(
+                    f"Firmware track mismatch: package is {pkg_track} firmware but the device is on the "
+                    f"{self.device_track} track."
+                )
+
+            # 5. Downgrade gate
+            is_downgrade = parse_version_tuple(self.package.version_string) < parse_version_tuple(installed)
+            if is_downgrade and not self.allow_downgrade:
+                raise FotaSafetyError(
+                    f"Package {self.package.version_string} is OLDER than the installed {installed}: "
+                    "downgrades need explicit confirmation (--allow-downgrade)."
+                )
+
+            # 6. Battery (headset only; the dongle is bus powered)
+            if self.target == "headset":
+                try:
+                    batt_pct = self.client.get_battery()
+                except Exception as e:
+                    raise FotaSafetyError(f"Could not read the headset battery level: {e}")
+                if batt_pct is None:
+                    raise FotaSafetyError("Could not read the headset battery level: refusing to flash.")
+                if batt_pct < MIN_HEADSET_BATTERY_PCT:
+                    raise FotaSafetyError(
+                        f"Headset battery is {batt_pct}%. Minimum {MIN_HEADSET_BATTERY_PCT}% required for flashing safety."
+                    )
 
         return {
             "package_valid": True,
             "target": self.target,
             "chip_target": actual_chip,
-            "firmware_track": self.package.firmware_track,
+            "firmware_track": pkg_track,
             "device_track": self.device_track,
             "version": self.package.version_string,
+            "installed_version": installed,
+            "is_downgrade": is_downgrade,
+            "relay_via_dongle": relay,
             "total_bytes": self.total_bytes,
             "total_chunks": self.total_chunks,
             "battery_percent": batt_pct,
             "dry_run": self.dry_run,
         }
 
+    def _transfer_stopped_message(self, reason: str, chunks_sent: int) -> str:
+        return (
+            f"{reason} after {chunks_sent} of {self.total_chunks} chunks. Do NOT unplug or power off the device. "
+            "It should still be running its previous firmware, but this tool has not verified the dual-bank "
+            "fallback. Check with 'firmware status' before doing anything else."
+        )
+
+    def _verify_installed_version(self) -> Dict[str, Any]:
+        """Polls the target's version until it reports the package version or the timeout expires."""
+        expected = parse_version_tuple(self.package.version_string)
+        deadline = time.time() + self.readback_timeout_sec
+        last_seen = "Unknown"
+        while True:
+            try:
+                last_seen = self._read_target_version()
+            except Exception:
+                # Expected while the device reboots into the new image.
+                pass
+            if last_seen != "Unknown" and parse_version_tuple(last_seen) == expected:
+                return {"verification": "confirmed", "reported_version": last_seen}
+            if time.time() >= deadline:
+                break
+            time.sleep(self.readback_interval_sec)
+        status = "no_response" if last_seen == "Unknown" else "version_mismatch"
+        return {"verification": status, "reported_version": last_seen}
+
     def execute(self, progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None) -> Dict[str, Any]:
         """
         Executes the FOTA block streaming pipeline.
         Calls progress_callback(dict) on progress increments.
+        Raises FotaInterruptedError on Ctrl-C / cancel and FotaTransferError on a failed write.
         """
-        self.preflight_check()
+        pre = self.preflight_check()
         start_time = time.time()
         bytes_sent = 0
-        route = ROUTE_DONGLE if self.target == "dongle" else ROUTE_DIRECT
+        chunks_sent = 0
+        relay = pre["relay_via_dongle"]
 
-        # Stream chunks
-        for chunk_idx in range(self.total_chunks):
-            if self.cancelled:
-                raise FotaSafetyError("FOTA flash process was cancelled by user.")
+        try:
+            for chunk_idx in range(self.total_chunks):
+                if self.cancelled:
+                    raise KeyboardInterrupt
 
-            start_byte = chunk_idx * self.chunk_size
-            end_byte = min(self.total_bytes, start_byte + self.chunk_size)
-            chunk_data = self.package.raw_data[start_byte:end_byte]
+                start_byte = chunk_idx * self.chunk_size
+                end_byte = min(self.total_bytes, start_byte + self.chunk_size)
+                chunk_data = self.package.raw_data[start_byte:end_byte]
 
-            if not self.dry_run and self.client:
-                # Live hardware write via Report 0x06 (cbreak / FOTA block transmission)
-                fota_packet = bytes([0x15, 0x5A]) + struct.pack("<HH", len(chunk_data) + 2, 0x1C03) + chunk_data
-                self.client.transport.write_race_packet(fota_packet, target_route=route)
-            else:
-                # In dry_run/simulation: smooth progression
-                time.sleep(0.001)
+                if not self.dry_run:
+                    # Live hardware write via Report 0x06 (cbreak / FOTA block transmission)
+                    fota_packet = bytes([0x15, 0x5A]) + struct.pack("<HH", len(chunk_data) + 2, 0x1C03) + chunk_data
+                    self.client.transport.write_race_packet(fota_packet, is_dongle=relay)
+                else:
+                    # In dry_run/simulation: smooth progression
+                    time.sleep(0.001)
 
-            bytes_sent += len(chunk_data)
-            elapsed = max(0.001, time.time() - start_time)
-            speed_kb = (bytes_sent / 1024.0) / elapsed
-            remaining_bytes = self.total_bytes - bytes_sent
-            eta_sec = (remaining_bytes / 1024.0) / speed_kb if speed_kb > 0 else 0.0
+                chunks_sent += 1
+                bytes_sent += len(chunk_data)
+                elapsed = max(0.001, time.time() - start_time)
+                speed_kb = (bytes_sent / 1024.0) / elapsed
+                remaining_bytes = self.total_bytes - bytes_sent
+                eta_sec = (remaining_bytes / 1024.0) / speed_kb if speed_kb > 0 else 0.0
 
-            if progress_callback and (chunk_idx % 10 == 0 or bytes_sent == self.total_bytes):
-                pct = int((bytes_sent / float(self.total_bytes)) * 100)
-                progress_callback({
-                    "bytes_sent": bytes_sent,
-                    "total_bytes": self.total_bytes,
-                    "percent": pct,
-                    "current_chunk": chunk_idx + 1,
-                    "total_chunks": self.total_chunks,
-                    "elapsed_sec": round(elapsed, 1),
-                    "speed_kb_s": round(speed_kb, 1),
-                    "eta_sec": round(eta_sec, 1),
-                    "done": bytes_sent >= self.total_bytes,
-                })
+                if progress_callback and (chunk_idx % 10 == 0 or bytes_sent == self.total_bytes):
+                    pct = int((bytes_sent / float(self.total_bytes)) * 100)
+                    progress_callback({
+                        "bytes_sent": bytes_sent,
+                        "total_bytes": self.total_bytes,
+                        "percent": pct,
+                        "current_chunk": chunk_idx + 1,
+                        "total_chunks": self.total_chunks,
+                        "elapsed_sec": round(elapsed, 1),
+                        "speed_kb_s": round(speed_kb, 1),
+                        "eta_sec": round(eta_sec, 1),
+                        "done": bytes_sent >= self.total_bytes,
+                    })
+        except KeyboardInterrupt:
+            self.cancelled = True
+            if self.dry_run or chunks_sent == 0:
+                raise FotaInterruptedError(
+                    f"FOTA flash cancelled after {chunks_sent} of {self.total_chunks} chunks"
+                    + (" (dry run, nothing was written)." if self.dry_run else " (nothing was written)."),
+                    chunks_sent, self.total_chunks,
+                )
+            raise FotaInterruptedError(
+                self._transfer_stopped_message("FOTA flash cancelled", chunks_sent), chunks_sent, self.total_chunks
+            )
+        except (OSError, RuntimeError) as e:
+            raise FotaTransferError(
+                self._transfer_stopped_message(f"Write failed ({e})", chunks_sent), chunks_sent, self.total_chunks
+            )
 
         duration = time.time() - start_time
-        return {
+        result = {
             "success": True,
             "target": self.target,
             "version": self.package.version_string,
+            "previous_version": pre["installed_version"],
             "total_bytes": self.total_bytes,
-            "chunks_sent": self.total_chunks,
+            "chunks_sent": chunks_sent,
             "duration_sec": round(duration, 2),
             "dry_run": self.dry_run,
+            "verification": "skipped (dry run)",
+            "reported_version": None,
         }
+        if not self.dry_run:
+            result.update(self._verify_installed_version())
+            result["success"] = result["verification"] == "confirmed"
+        return result
 
 
 # ==============================================================================

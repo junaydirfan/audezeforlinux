@@ -32,12 +32,12 @@ The Audeze Maxwell and its dongle run **Airoha (MediaTek) AB15xx** System-on-Chi
 
 | Chip identifier (TLV 0x0020) | Target | Live flashing |
 |---|---|---|
-| `AB1568_Dongle` | Dongle | Supported |
-| `AB1568_Headset` | Headset | Supported |
+| `AB1568_Dongle` | Dongle | **Blocked** (dry-run only) |
+| `AB1568_Headset` | Headset | **Blocked** (dry-run only) |
 | `AB1565_ULL2_DONGLE` | Maxwell 2 dongle | **Blocked** (dry-run only) |
 | `AB1585_Headset` | Maxwell 2 headset | **Blocked** (dry-run only) |
 
-The Maxwell 2 ids come from the official Maxwell 2 packages (v1.0.5.7.4 and the v1.0.2.60.2 rollback) published in Audeze's `maxwell-2-fw.json` list. The container format below parses and verifies on them. The RACE `0x15` FOTA block framing in section 3.1 has **not** been verified on these chips yet, so `firmware flash` refuses live writes to them until USB captures of the official updater confirm it. Packages with an unrecognised or missing chip id are also refused for live flashing.
+The Maxwell 2 ids come from the official Maxwell 2 packages (v1.0.5.7.4 and the v1.0.2.60.2 rollback) published in Audeze's `maxwell-2-fw.json` list. The container format below parses and verifies on them. The RACE `0x15` FOTA block framing in section 3.1 has **not** been verified against captures of the official updater on **any** chip, so `firmware flash` refuses live writes for all of them. (Until October 2026 the live write path also crashed before sending its first chunk, so it has never written to a device.) Packages with an unrecognised or missing chip id are also refused for live flashing.
 
 ### Firmware tracks: regular vs ANC Maxwell 2
 Audeze publishes the Maxwell 2 ANC firmware as a **separate track** (`mw2-anc/` in the official bucket, `Maxwell2ANC_*` packages; v1.0.5.6 is listed in `maxwell-2-anc-rollback.json`). The ANC packages report **the same** chip ids (`AB1565_ULL2_DONGLE`, `AB1585_Headset`) and design names as regular Maxwell 2 packages, but the images differ (the v1.0.5.6 ANC headset image is 2,625,444 bytes, the v1.0.5.7.4 regular one 2,316,701 bytes). So the chip id can't tell the tracks apart:
@@ -167,12 +167,30 @@ audezeforlinux firmware simulate path/to/firmware.bin --target headset
 ```
 Simulates the entire FOTA block fragmentation layout across 62-byte HID reports without transmitting to physical hardware.
 
-### 6. FOTA Flashing Engine with Dual-Bank Protection
+### 6. FOTA Flashing Engine
 ```bash
-# Dry-run execution (simulates chunking, battery check, and hash verification):
+# Dry-run execution (simulates chunking and runs the package checks):
 audezeforlinux firmware flash path/to/firmware.bin --target dongle --dry-run
 
-# Live physical flash (requires explicit safety flag and typing 'CONFIRM'):
-audezeforlinux firmware flash path/to/firmware.bin --target dongle --confirm-risk
+# Live physical flash (currently refused for every chip, see section 3):
+audezeforlinux firmware flash path/to/firmware.bin --target dongle --confirm-risk [--allow-downgrade]
 ```
-Streams 56-byte chunks into the inactive Bank B of the target SoC over USB HID Report `0x06`. If any error or power drop occurs, the bootloader automatically reverts to Bank A on reboot, preventing any bricking risk.
+The engine streams the package as 56-byte `0x15 0x5A … 0x1C03` blocks over HID Report `0x06`. It does **not** yet send any start or commit commands, or read the device's `0x15 0x5B` acknowledgements, because those steps are not known. They will be added from USB captures of the official updater, not guessed.
+
+Live flashing **fails closed**. Every check runs before the `CONFIRM` prompt, and anything that can't be read is a refusal:
+
+| Check | Refused when |
+|---|---|
+| Package | Outer SHA-256 or any partition hash fails; chip id unknown or built for the other target |
+| Protocol | The chip isn't marked as verified in `KNOWN_CHIP_IDS` (currently none are) |
+| Connection & route | No live connection; `--target dongle` while connected over direct USB-C. Through a dongle, route `0x00` reaches the dongle and `0x80` the headset; over USB-C, `0x00` is the headset |
+| Installed version | Can't be read, or isn't a known release (so the firmware track can't be confirmed) |
+| Firmware track | Package track (regular / ANC Maxwell 2 / Maxwell 1) differs from the device's |
+| Downgrade | Package is older than the installed version, unless `--allow-downgrade` is passed. The prompt then asks you to type `DOWNGRADE` |
+| Battery (headset) | Can't be read, or below 50% |
+
+During the transfer, Ctrl-C or a failed write stops it and reports how many chunks were sent (exit code 3). The tool says to leave the device powered and check `firmware status`. The AB1568 dual-bank fallback described in section 4 has **not** been verified by this tool, so an interrupted transfer is not guaranteed to be safe.
+
+After the transfer, the target's version is read back (polling while the device reboots). The flash only counts as successful if it reports the package version. Otherwise the CLI exits with code 4.
+
+The live path is covered by tests against a fake device (`TestFotaLiveHarness` in `tests/test_protocol.py`), which enable live writes only inside each test.
