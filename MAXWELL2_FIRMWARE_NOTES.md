@@ -87,6 +87,43 @@ Safe groundwork for the issue. Live Maxwell 2 flashing is still blocked:
 Open question: the AB1568 framing also seems never to have been verified against the official
 app (no captures in the repo). Consider whether AB1568 live flashing should also be disabled.
 
+## Maxwell 2 ANC findings (2026-10-26)
+
+Audeze publishes a separate ANC firmware track:
+- `maxwell-2-anc-rollback.json` → v1.0.5.6 → `mw2-anc/1.0.5.6/maxwell-2-anc-fw-5.6.json`
+  (`Maxwell2ANC_{PS,XBOX}_{dongle,headset}_v1.0.5.6.bin`, dated 20 Aug 2026).
+- Regular track: `maxwell-2-fw.json` (v1.0.5.7.4), `maxwell-2-rollback.json` (v1.0.2.60.2).
+- The name of the *current* (non-rollback) ANC list is unknown; it's not `maxwell-2-anc-fw.json`.
+
+Inspected the PS ANC dongle and headset packages with `firmware inspect`. Both pass the outer SHA-256
+and all partition hashes.
+
+| Package | Chip id | Design | Partitions | Size |
+|---|---|---|---|---|
+| ANC PS dongle v1.0.5.6 | `AB1565_ULL2_DONGLE` | dongle_ref_design | 2 (flash 0x13000, 0xE2000) | 1,198,488 |
+| ANC PS headset v1.0.5.6 | `AB1585_Headset` | headset_ref_design | 6 (0x15000 … 0x7E0000) | 2,625,444 |
+| Regular PS dongle v1.0.5.7.4 | `AB1565_ULL2_DONGLE` (per issue) | ? | ? | 1,199,163 |
+| Regular PS headset v1.0.5.7.4 | `AB1585_Headset` (per issue) | ? | ? | 2,316,701 |
+
+What this means:
+1. **ANC and regular Maxwell 2 use the same chip ids**, so TLV 0x0020 can't tell them apart. The
+   design name doesn't either. If Maxwell 2 live flashing is ever enabled, preflight would let a
+   regular package go onto an ANC headset (the headset images differ by ~300 KB) or the other way
+   round. A track check based on the device identity (USB PID or a firmware query) is needed first.
+2. **Wrong update advice:** an ANC unit on v1.0.5.6 is compared against the regular catalog and told
+   v1.0.5.7.4 is "available". That's regular, non-ANC firmware. Can't fix this properly without knowing
+   how to detect an ANC unit.
+3. The ANC USB product IDs are unknown. `transport.py` only knows 4B28/4B29/4B2A for Maxwell 2. We need
+   `lsusb` output from an ANC owner.
+4. `docs/FIRMWARE.md` says packages have a fixed 4-partition layout at 0x080xxxxx with the chip TLV at
+   0x01EE. These packages have 2 or 6 partitions at different addresses and different TLV offsets.
+   The parser copes because it scans TLVs, but the docs (and the "all 4 partitions" wording in
+   preflight) are AB1568-specific.
+
+Downloaded copies (scratch, not in repo): `/tmp/claude-1000/-home-junaids--claude-spares-spare-m0lk1A/504fc147-20b4-4c3e-abac-0455e7bd5ab7/scratchpad/anc_bins/`
+- dongle sha256 `b16ecc9793d6ab9530dc45805cc486061f302fa389e9215f66d81fb587571a39`
+- headset sha256 `2d5149fc5859c8c437b83fe2d4b83b8068ab9d9038ae61704c73640be90c6f9a`
+
 ## Plan / status
 
 - [ ] **Merge the version-tuple PR** (recommended; not done yet as of these notes).
@@ -100,6 +137,30 @@ app (no captures in the repo). Consider whether AB1568 live flashing should also
 - [ ] Meanwhile (optional): make preflight *recognise* Maxwell 2 chip ids and give a clear
       "Maxwell 2 flashing not yet supported" error instead of a generic "Target mismatch".
 - [ ] Update `docs/FIRMWARE.md` to cover the Maxwell 2 chips.
+- [x] ANC catalog track + regular-vs-ANC firmware-track check (done 2026-10-26, see below).
+- [x] Corrected the fixed-layout claims in `docs/FIRMWARE.md`.
+- [ ] ANC: get `lsusb` output from an ANC owner (product IDs unknown), and find the current
+      (non-rollback) ANC release so the ANC catalog can be marked complete.
+- [ ] Add the regular Maxwell 2 package hashes to `KNOWN_PACKAGE_TRACKS` (only the two PS ANC
+      hashes are in it so far).
+
+## ANC track work (2026-10-26)
+
+- `FIRMWARE_CATALOG["maxwell2_anc"]`: v1.0.5.6, `baseline_complete: False`. `firmware check` reports
+  "LATEST RELEASE UNKNOWN" instead of "up to date".
+- `detect_device_track(version, strict=False)`: maxwell1 / maxwell2 / maxwell2_anc from the installed
+  version. Non-strict mode falls back to regular Maxwell 2 for unknown versions (update advice only).
+  Strict mode (the flash path) returns None unless the version is known on exactly one track.
+- `FirmwarePackage.firmware_track`: known official sha256 (`KNOWN_PACKAGE_TRACKS`), then the
+  `Maxwell2ANC` file name prefix, then the chip id. Shown in `firmware inspect`.
+- `check_available_updates(..., package_path)` reports `WRONG FIRMWARE TRACK` when the package track
+  differs from the device track.
+- `FotaEngine(device_track=...)`: preflight refuses cross-track packages. A live flash of a Maxwell 2
+  chip also requires a known device track. The `firmware flash` CLI reads the device version (strict)
+  before live flashes.
+- Tests: `test_firmware_track_detection`, `test_fota_preflight_track_gating`; 17 tests pass.
+- Checked against the real ANC packages: ANC package on v1.0.5.6 → matches; on v1.0.5.7.4 → WRONG
+  FIRMWARE TRACK; a renamed copy is still identified as ANC by its hash.
 
 ## Suggested issue reply (copy/paste)
 

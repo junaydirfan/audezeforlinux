@@ -74,6 +74,21 @@ FIRMWARE_CATALOG = {
             },
         ],
     },
+    # Separate Audeze track (mw2-anc/ in the official bucket). v1.0.5.6 is the version listed in
+    # maxwell-2-anc-rollback.json, so a newer ANC release probably exists that we have not seen.
+    "maxwell2_anc": {
+        "model": "Audeze Maxwell 2 ANC (Xbox / PlayStation / PC)",
+        "current_stable": "v1.0.5.6",
+        "baseline_complete": False,
+        "releases": [
+            {
+                "version": "v1.0.5.6",
+                "date": "2026-08-20",
+                "notes": "ANC firmware track (Maxwell2ANC_* packages). Listed by Audeze as the ANC rollback release; no public changelog.",
+                "latest": False,
+            },
+        ],
+    },
     "maxwell1": {
         "model": "Audeze Maxwell 1 (Original)",
         "current_stable": "v1.0.1.74",
@@ -119,19 +134,52 @@ KNOWN_CHIP_IDS: Dict[str, Tuple[str, bool]] = {
 }
 
 
+# Regular Maxwell 2 and Maxwell 2 ANC packages carry identical chip ids and design names,
+# so the firmware track has to come from elsewhere: a known official package hash first,
+# then the official file name prefix.
+MAXWELL2_CHIP_IDS = ("AB1565_ULL2_DONGLE", "AB1585_Headset")
+KNOWN_PACKAGE_TRACKS: Dict[str, str] = {
+    # sha256 of the whole file -> catalog track
+    "b16ecc9793d6ab9530dc45805cc486061f302fa389e9215f66d81fb587571a39": "maxwell2_anc",  # Maxwell2ANC_PS_dongle_v1.0.5.6.bin
+    "2d5149fc5859c8c437b83fe2d4b83b8068ab9d9038ae61704c73640be90c6f9a": "maxwell2_anc",  # Maxwell2ANC_PS_headset_v1.0.5.6.bin
+}
+
+
+def detect_device_track(current_version: str, strict: bool = False) -> Optional[str]:
+    """
+    Picks the catalog track for an installed firmware version.
+    Maxwell 1 shipped 1.0.1.x; every Maxwell 2 build (1.0.2.49 and up) is newer than that.
+    ANC and regular Maxwell 2 share a version scheme, so only a version that is known on the
+    ANC track and not on the regular one is treated as ANC. Other Maxwell 2 versions fall back
+    to the regular track, unless strict is set (used before flashing), which returns None for
+    any version that is not a known release on exactly one track.
+    """
+    if parse_version_tuple(current_version) < (1, 0, 2):
+        return None if strict and current_version.strip() in ("", "Unknown") else "maxwell1"
+    ver = current_version.strip().lower().lstrip("v")
+    anc = {r["version"].lower().lstrip("v") for r in FIRMWARE_CATALOG["maxwell2_anc"]["releases"]}
+    regular = {r["version"].lower().lstrip("v") for r in FIRMWARE_CATALOG["maxwell2"]["releases"]}
+    if ver in anc and ver not in regular:
+        return "maxwell2_anc"
+    if strict and not (ver in regular and ver not in anc):
+        return None
+    return "maxwell2"
+
+
 class FirmwarePackage:
     """
     Parses, validates, and unpacks an official Audeze / Airoha FOTA container (.bin).
     Seen with AB1568 chip ids and, on Maxwell 2 packages, AB1565_ULL2 (dongle) / AB1585 (headset).
     Container Layout:
       0x0000-0x001F: Top-level SHA-256 hash of bytes[0x100:]
-      0x0100-0x010D: TLV 0x0011 Basic info (flags, LZMA stream start 0x1000, stream size)
-      0x010E-0x0129: TLV 0x0013 Version string
-      0x012E-0x0165: TLV 0x0012 Partition table (4 entries * 12 bytes)
-      0x0166-0x01ED: TLV 0x0014 Per-partition SHA-256 hashes (4 * 32 bytes)
-      0x01EE-0x01FC: TLV 0x0020 Chip identifier (see KNOWN_CHIP_IDS)
-      0x0200-0x0214: TLV 0x0021 Design name
-      0x1000+:       LZMA-Alone compressed stream
+      0x0100+:       Sequential TLV records (type LE16, length LE16, value); offsets vary per package:
+                     0x0011 Basic info (flags, LZMA stream start, stream size)
+                     0x0013 Version string
+                     0x0012 Partition table (LE32 count + count * 12 bytes)
+                     0x0014 Per-partition SHA-256 hashes (LE32 count + count * 32 bytes)
+                     0x0020 Chip identifier (see KNOWN_CHIP_IDS)
+                     0x0021 Design name
+      0x1000+:       LZMA-Alone compressed stream (start given by TLV 0x0011)
     """
 
     def __init__(self, filepath: str):
@@ -308,6 +356,18 @@ class FirmwarePackage:
 
         return extracted_files
 
+    @property
+    def firmware_track(self) -> str:
+        """Catalog track this package belongs to ("maxwell2", "maxwell2_anc", "maxwell1" or "unknown")."""
+        known = KNOWN_PACKAGE_TRACKS.get(hashlib.sha256(self.raw_data).hexdigest())
+        if known:
+            return known
+        if self.chip_id in MAXWELL2_CHIP_IDS:
+            return "maxwell2_anc" if self.filename.lower().startswith("maxwell2anc") else "maxwell2"
+        if self.chip_id.startswith("AB1568"):
+            return "maxwell1"
+        return "unknown"
+
     def to_dict(self) -> Dict[str, Any]:
         """Summarizes parsed metadata as a dictionary."""
         return {
@@ -319,6 +379,7 @@ class FirmwarePackage:
             "chip_id": self.chip_id,
             "chip_target": KNOWN_CHIP_IDS.get(self.chip_id, ("unknown", False))[0],
             "live_flash_supported": KNOWN_CHIP_IDS.get(self.chip_id, ("unknown", False))[1],
+            "firmware_track": self.firmware_track,
             "design_name": self.design_name,
             "outer_sha256": self.outer_hash,
             "outer_hash_valid": self.outer_hash_valid,
@@ -400,10 +461,7 @@ def check_available_updates(current_version: str, package_path: Optional[str] = 
     Evaluates update availability against the local baseline catalog or an explicit firmware package (.bin).
     Data provenance is explicitly surfaced to distinguish hardware reads from offline catalog entries.
     """
-    # Maxwell 1 shipped 1.0.1.x firmware; every Maxwell 2 build (1.0.2.49 and up) is newer than that.
-    # Matching on the "1.0.5" substring mislabelled 1.0.2.x Maxwell 2 units as Maxwell 1.
-    is_v2 = parse_version_tuple(current_version) >= (1, 0, 2)
-    cat_key = "maxwell2" if is_v2 else "maxwell1"
+    cat_key = detect_device_track(current_version) or "maxwell2"
     catalog = FIRMWARE_CATALOG.get(cat_key, FIRMWARE_CATALOG["maxwell2"])
 
     current_tuple = parse_version_tuple(current_version)
@@ -423,6 +481,16 @@ def check_available_updates(current_version: str, package_path: Optional[str] = 
             status = "VERSION MATCHES INSTALLED"
             status_symbol = "✔"
 
+        notice = "Evaluated against local .bin package file. Outer SHA-256 and partition integrity verified."
+        pkg_track = pkg.firmware_track
+        if pkg_track in FIRMWARE_CATALOG and cat_key in FIRMWARE_CATALOG and pkg_track != cat_key:
+            status = "WRONG FIRMWARE TRACK"
+            status_symbol = "✖"
+            notice = (
+                f"This package is {FIRMWARE_CATALOG[pkg_track]['model']} firmware, but the installed version "
+                f"looks like {catalog['model']}. Do not install firmware from a different track."
+            )
+
         return {
             "current_installed": current_version,
             "target_version": pkg_ver,
@@ -433,25 +501,34 @@ def check_available_updates(current_version: str, package_path: Optional[str] = 
             "is_package": True,
             "package_valid": pkg.outer_hash_valid,
             "package_chip": pkg.chip_id,
+            "package_track": pkg_track,
             "package_size_kb": round(pkg.file_size / 1024, 1),
-            "notice": "Evaluated against local .bin package file. Outer SHA-256 and partition integrity verified.",
+            "notice": notice,
             "releases": catalog["releases"],
         }
     else:
         latest_ver = catalog["current_stable"]
         latest_tuple = parse_version_tuple(latest_ver)
         is_up_to_date = (current_tuple >= latest_tuple)
+        status = "MATCHES OFFLINE BASELINE" if is_up_to_date else "OFFLINE UPDATE AVAILABLE"
+        notice = "Audeze has no public cloud REST API. This check is evaluated against our local baseline catalog (not a live Audeze HQ cloud query). To check a downloaded update, run with --package <file.bin>."
+        if not catalog.get("baseline_complete", True):
+            status = "LATEST RELEASE UNKNOWN" if is_up_to_date else status
+            notice = (
+                f"The local catalog for {catalog['model']} is incomplete: {latest_ver} is the newest release "
+                "we know of, but Audeze may have published a newer one. " + notice
+            )
 
         return {
             "current_installed": current_version,
             "latest_available": latest_ver,
             "is_up_to_date": is_up_to_date,
-            "status": "MATCHES OFFLINE BASELINE" if is_up_to_date else "OFFLINE UPDATE AVAILABLE",
+            "status": status,
             "status_symbol": "✔" if is_up_to_date else "●",
             "model_detected": catalog["model"],
             "source": "Offline Baseline Catalog (Local)",
             "is_package": False,
-            "notice": "Audeze has no public cloud REST API. This check is evaluated against our local baseline catalog (not a live Audeze HQ cloud query). To check a downloaded update, run with --package <file.bin>.",
+            "notice": notice,
             "releases": catalog["releases"],
         }
 
@@ -512,10 +589,13 @@ class FotaEngine:
         target: str = "dongle",
         client: Optional[MaxwellClient] = None,
         dry_run: bool = True,
+        device_track: Optional[str] = None,
     ):
         self.package = package
         self.target = target.lower()
         self.client = client
+        # Catalog track of the connected device (see detect_device_track), None if unknown.
+        self.device_track = device_track
         self.dry_run = dry_run
         self.chunk_size = 56
         self.total_bytes = package.file_size
@@ -526,8 +606,9 @@ class FotaEngine:
         """
         Validates all safety prerequisites:
         1. Package outer SHA-256 integrity.
-        2. All 4 internal partition SHA-256 hashes.
+        2. Every internal partition SHA-256 hash.
         3. Chip ID is known (KNOWN_CHIP_IDS) and built for the selected target.
+           The package's firmware track (e.g. regular vs ANC Maxwell 2) must match the device's.
            Live flashing additionally requires a chip whose FOTA framing is verified.
         4. Battery level >= 50% (if flashing headset or querying client).
         """
@@ -553,6 +634,17 @@ class FotaEngine:
                 raise FotaSafetyError(
                     f"Target mismatch: Attempting to flash {self.target.upper()} with package compiled for {actual_chip}!"
                 )
+            pkg_track = self.package.firmware_track
+            if self.device_track and pkg_track != "unknown" and pkg_track != self.device_track:
+                raise FotaSafetyError(
+                    f"Firmware track mismatch: package is {pkg_track} firmware but the device is on the "
+                    f"{self.device_track} track. Regular and ANC Maxwell 2 firmware are not interchangeable."
+                )
+            if actual_chip in MAXWELL2_CHIP_IDS and not self.dry_run and not self.device_track:
+                raise FotaSafetyError(
+                    f"Cannot confirm whether the device is a regular or ANC Maxwell 2 ({actual_chip} is used by both): "
+                    "refusing to flash without a known device firmware track."
+                )
             if not live_supported and not self.dry_run:
                 raise FotaSafetyError(
                     f"Live flashing of {actual_chip} (Maxwell 2) is not supported yet: the FOTA packet framing "
@@ -574,6 +666,8 @@ class FotaEngine:
             "package_valid": True,
             "target": self.target,
             "chip_target": actual_chip,
+            "firmware_track": self.package.firmware_track,
+            "device_track": self.device_track,
             "version": self.package.version_string,
             "total_bytes": self.total_bytes,
             "total_chunks": self.total_chunks,
@@ -699,6 +793,7 @@ def format_firmware_check_plain(info: Dict[str, Any]) -> str:
     if info.get("is_package"):
         lines.append(f"│  Target Package Version    : {info.get('target_version', 'Unknown'):<38} │")
         lines.append(f"│  Target Chip Architecture  : {info.get('package_chip', 'Unknown'):<38} │")
+        lines.append(f"│  Package Firmware Track    : {info.get('package_track', 'unknown'):<38} │")
         lines.append(f"│  Package Integrity Check   : {'✔ SHA-256 PASS (Valid)' if info.get('package_valid') else '✖ CORRUPTED':<38} │")
     else:
         lines.append(f"│  Latest Catalog Baseline   : {info.get('latest_available', 'Unknown'):<38} │")
@@ -750,6 +845,7 @@ def format_firmware_inspect_plain(info: Dict[str, Any]) -> str:
     lines.append(f"│  Target Chip Identifier    : {info.get('chip_id', 'Unknown'):<38} │")
     flash_s = "Supported" if info.get("live_flash_supported") else "Not supported (dry-run only)"
     lines.append(f"│  Live Flash Support        : {flash_s:<38} │")
+    lines.append(f"│  Firmware Track            : {info.get('firmware_track', 'unknown'):<38} │")
     lines.append(f"│  Reference Design Name     : {info.get('design_name', 'Unknown'):<38} │")
 
     outer_v = "VALID (Pass)" if info.get("outer_hash_valid") else "INVALID (Tampered/Corrupted)"

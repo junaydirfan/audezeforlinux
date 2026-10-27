@@ -329,7 +329,7 @@ class TestCommandBuildersAndParsers(unittest.TestCase):
             if os.path.exists(t_path):
                 os.unlink(t_path)
 
-    def _write_package(self, chip_id=None):
+    def _write_package(self, chip_id=None, name=None):
         """Writes a minimal valid FOTA container, optionally with a TLV 0x0020 chip id."""
         import tempfile, lzma
         p1 = b"PARTITION_" * 40
@@ -352,6 +352,14 @@ class TestCommandBuildersAndParsers(unittest.TestCase):
 
         full = hdr + comp
         full[0:32] = hashlib.sha256(full[0x100:]).digest()
+        if name:
+            d = tempfile.mkdtemp()
+            path = os.path.join(d, name)
+            with open(path, "wb") as f:
+                f.write(full)
+            self.addCleanup(os.rmdir, d)
+            self.addCleanup(os.unlink, path)
+            return path
         with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as f:
             f.write(full)
         self.addCleanup(os.unlink, f.name)
@@ -389,6 +397,62 @@ class TestCommandBuildersAndParsers(unittest.TestCase):
         info = FirmwarePackage(self._write_package("AB1585_Headset")).to_dict()
         self.assertEqual(info["chip_target"], "headset")
         self.assertFalse(info["live_flash_supported"])
+
+    def test_firmware_track_detection(self):
+        """Regular and ANC Maxwell 2 share chip ids, so the track comes from version / package identity."""
+        from maxwell2.firmware import FirmwarePackage, detect_device_track, check_available_updates
+
+        self.assertEqual(detect_device_track("v1.0.1.74"), "maxwell1")
+        self.assertEqual(detect_device_track("v1.0.2.60.2"), "maxwell2")
+        self.assertEqual(detect_device_track("v1.0.5.7.4"), "maxwell2")
+        self.assertEqual(detect_device_track("v1.0.5.6"), "maxwell2_anc")
+        self.assertEqual(detect_device_track("v1.0.5.9"), "maxwell2")
+        # Strict mode (used before flashing) refuses to guess on versions it has not seen.
+        self.assertIsNone(detect_device_track("v1.0.5.9", strict=True))
+        self.assertIsNone(detect_device_track("Unknown", strict=True))
+        self.assertEqual(detect_device_track("v1.0.5.6", strict=True), "maxwell2_anc")
+        self.assertEqual(detect_device_track("v1.0.5.7.4", strict=True), "maxwell2")
+
+        chk = check_available_updates("v1.0.5.6")
+        self.assertIn("ANC", chk["model_detected"])
+        self.assertEqual(chk["status"], "LATEST RELEASE UNKNOWN")
+
+        regular = FirmwarePackage(self._write_package("AB1585_Headset", "Maxwell2_PS_headset_v1.0.5.7.4.bin"))
+        anc = FirmwarePackage(self._write_package("AB1585_Headset", "Maxwell2ANC_PS_headset_v1.0.5.6.bin"))
+        self.assertEqual(regular.firmware_track, "maxwell2")
+        self.assertEqual(anc.firmware_track, "maxwell2_anc")
+        self.assertEqual(FirmwarePackage(self._write_package("AB1568_Dongle")).firmware_track, "maxwell1")
+
+        wrong = check_available_updates("v1.0.5.6", package_path=regular.filepath)
+        self.assertEqual(wrong["status"], "WRONG FIRMWARE TRACK")
+        same = check_available_updates("v1.0.5.6", package_path=anc.filepath)
+        self.assertEqual(same["package_track"], "maxwell2_anc")
+        self.assertNotEqual(same["status"], "WRONG FIRMWARE TRACK")
+
+    def test_fota_preflight_track_gating(self):
+        """Preflight refuses cross-track packages and live Maxwell 2 flashes with an unknown device track."""
+        from maxwell2.firmware import FirmwarePackage, FotaEngine, FotaSafetyError
+
+        regular = FirmwarePackage(self._write_package("AB1585_Headset", "Maxwell2_PS_headset_v1.0.5.7.4.bin"))
+        anc = FirmwarePackage(self._write_package("AB1585_Headset", "Maxwell2ANC_PS_headset_v1.0.5.6.bin"))
+
+        cases = [
+            # package, device track, dry_run, error substring (None = passes)
+            (regular, "maxwell2_anc", True, "track mismatch"),
+            (anc, "maxwell2", True, "track mismatch"),
+            (anc, "maxwell2_anc", True, None),
+            (anc, None, True, None),
+            (anc, None, False, "regular or ANC"),
+            (anc, "maxwell2_anc", False, "not supported yet"),
+        ]
+        for pkg, device_track, dry_run, err in cases:
+            with self.subTest(pkg=pkg.filename, device_track=device_track, dry_run=dry_run):
+                engine = FotaEngine(pkg, target="headset", dry_run=dry_run, device_track=device_track)
+                if err is None:
+                    self.assertEqual(engine.preflight_check()["firmware_track"], "maxwell2_anc")
+                else:
+                    with self.assertRaisesRegex(FotaSafetyError, err):
+                        engine.preflight_check()
 
 
 if __name__ == "__main__":

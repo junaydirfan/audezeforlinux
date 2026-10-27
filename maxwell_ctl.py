@@ -279,7 +279,14 @@ def main():
             transport = Transport(hidraw_path=args.device, dry_run=is_dry)
             with transport:
                 client = MaxwellClient(transport)
-                engine = FotaEngine(pkg, target=args.target, client=client, dry_run=is_dry)
+                device_track = None
+                if not is_dry:
+                    from maxwell2.firmware import detect_device_track
+                    try:
+                        device_track = detect_device_track(client.get_firmware().get("firmware", ""), strict=True)
+                    except Exception:
+                        pass
+                engine = FotaEngine(pkg, target=args.target, client=client, dry_run=is_dry, device_track=device_track)
 
                 print(f"[*] Starting FOTA Flash {'(DRY RUN)' if is_dry else '(LIVE HARDWARE)'}:")
                 print(f"    File: {pkg.filename} (Version: {pkg.version_string})")
