@@ -25,8 +25,11 @@ from maxwell2.protocol import (
 )
 
 AUDEZE_VID = 0x3329
-KNOWN_PIDS = [0x4B18, 0x4B19, 0x4B1A, 0x4B1E, 0x4B28, 0x4B29, 0x4B2A]
-DONGLE_PIDS = [0x4B18, 0x4B19, 0x4B28, 0x4B29]
+KNOWN_PIDS = [0x4B18, 0x4B19, 0x4B1A, 0x4B1E, 0x4B28, 0x4B29, 0x4B2A, 0x4BA8]
+DONGLE_PIDS = [0x4B18, 0x4B19, 0x4B28, 0x4B29, 0x4BA8]
+# Maxwell 2 ANC units. The Xbox dongle (4BA8) was reported in issue #3; the PlayStation dongle
+# and USB-C IDs are still unknown.
+ANC_PIDS = [0x4BA8]
 
 # Linux HIDRAW ioctl definitions:
 # HIDIOCGINPUT(len) = _IOC(_IOC_READ|_IOC_WRITE, 'H', 0x0A, len)
@@ -58,6 +61,7 @@ def list_maxwell_devices() -> List[dict]:
         0x4B28: "Maxwell 2 (Xbox Dongle)",
         0x4B29: "Maxwell 2 (PlayStation / PC Dongle)",
         0x4B2A: "Maxwell 2 (Direct USB)",
+        0x4BA8: "Maxwell 2 ANC (Xbox Dongle)",
         0x4B18: "Maxwell 1 (Xbox Dongle)",
         0x4B19: "Maxwell 1 (PlayStation Dongle)",
         0x4B1A: "Maxwell 1 (PlayStation USB)",

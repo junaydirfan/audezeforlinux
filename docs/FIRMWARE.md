@@ -45,7 +45,7 @@ Audeze publishes the Maxwell 2 ANC firmware as a **separate track** (`mw2-anc/` 
 - A package's track (`firmware_track` in `firmware inspect`) comes from a table of known official package hashes, then from the `Maxwell2ANC` file name prefix.
 - The device's track is inferred from its installed version. Only versions known on exactly one track count. `firmware check` falls back to the regular track for unknown versions; the flash path does not.
 - Preflight refuses a package whose track differs from the device's. A live flash of a Maxwell 2-family chip also needs the device track to be known.
-- The ANC catalog is incomplete (the newest ANC release is unknown), so `firmware check` says so instead of reporting "up to date". The ANC USB product IDs are also still unknown.
+- The ANC catalog is incomplete (the newest ANC release is unknown), so `firmware check` says so instead of reporting "up to date". The ANC Xbox dongle is `3329:4BA8`; a live flash through it treats the device as ANC regardless of version. The ANC PlayStation dongle and USB-C IDs are still unknown.
 
 ### 3.1 Packet Framing
 While standard settings and telemetry use RACE sync byte `0x05`, Airoha's Firmware-Over-The-Air (FOTA) subsystem uses sync byte **`0x15`**:

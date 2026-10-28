@@ -15,6 +15,7 @@ import time
 from typing import Optional, Dict, Any, List, Tuple, Callable
 
 from maxwell2.client import MaxwellClient
+from maxwell2.transport import ANC_PIDS
 from maxwell2.protocol import (
     build_firmware_command,
     parse_firmware_notification,
@@ -723,6 +724,8 @@ class FotaEngine:
                 raise FotaSafetyError(f"Could not read the {self.target} firmware version: refusing to flash blind.")
             self.installed_version = installed
 
+            if not self.device_track and getattr(self._live_transport(), "product_id", None) in ANC_PIDS:
+                self.device_track = "maxwell2_anc"
             if not self.device_track:
                 self.device_track = detect_device_track(installed, strict=True)
             if not self.device_track:

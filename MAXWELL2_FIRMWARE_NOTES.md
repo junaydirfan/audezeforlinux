@@ -113,8 +113,10 @@ What this means:
 2. **Wrong update advice:** an ANC unit on v1.0.5.6 is compared against the regular catalog and told
    v1.0.5.7.4 is "available". That's regular, non-ANC firmware. Can't fix this properly without knowing
    how to detect an ANC unit.
-3. The ANC USB product IDs are unknown. `transport.py` only knows 4B28/4B29/4B2A for Maxwell 2. We need
-   `lsusb` output from an ANC owner.
+3. ANC USB product IDs: issue #3 (2026-10-28) reported the ANC Xbox dongle as `3329:4BA8`
+   (product string is the same "Audeze Maxwell XBOX Dongle" as 4B28). Added to `transport.py`
+   (`ANC_PIDS`), udev, discover.py; FOTA preflight uses it as the device track. PS ANC dongle and
+   USB-C IDs still unknown (4BA9/4BAA would follow the pattern but are unconfirmed, so not added).
 4. `docs/FIRMWARE.md` says packages have a fixed 4-partition layout at 0x080xxxxx with the chip TLV at
    0x01EE. These packages have 2 or 6 partitions at different addresses and different TLV offsets.
    The parser copes because it scans TLVs, but the docs (and the "all 4 partitions" wording in

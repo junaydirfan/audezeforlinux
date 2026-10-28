@@ -22,6 +22,7 @@ KNOWN_PRODUCTS = {
     0x4B28: "Maxwell 2 (Xbox Dongle)",
     0x4B29: "Maxwell 2 (PlayStation / PC Dongle)",
     0x4B2A: "Maxwell 2 (USB-C Direct)",
+    0x4BA8: "Maxwell 2 ANC (Xbox Dongle)",
 }
 
 USAGE_PAGE_NAMES = {

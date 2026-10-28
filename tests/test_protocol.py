@@ -462,9 +462,10 @@ class TestCommandBuildersAndParsers(unittest.TestCase):
 class FakeFotaTransport:
     """Stands in for Transport on the live flash path: records writes, can fail or be interrupted."""
 
-    def __init__(self, is_dongle=True, fail_at=None, interrupt_at=None):
+    def __init__(self, is_dongle=True, fail_at=None, interrupt_at=None, product_id=None):
         self.dry_run = False
         self.is_dongle = is_dongle
+        self.product_id = product_id
         self.fail_at = fail_at
         self.interrupt_at = interrupt_at
         self.writes = []  # (packet, is_dongle route flag)
@@ -587,6 +588,12 @@ class TestFotaLiveHarness(unittest.TestCase):
                 with self.assertRaisesRegex(FotaSafetyError, err):
                     engine.execute()
                 self.assertEqual(t.writes, [])
+
+        # The ANC Xbox dongle PID marks the device as ANC even when its version is a regular release.
+        engine, t = self._engine(transport=FakeFotaTransport(product_id=0x4BA8))
+        with self.assertRaisesRegex(FotaSafetyError, "track mismatch"):
+            engine.execute()
+        self.assertEqual(t.writes, [])
 
         from maxwell2.firmware import FirmwarePackage, FotaEngine
         pkg = FirmwarePackage(self._write_package("AB1585_Headset", "Maxwell2_PS_headset_v1.0.5.7.4.bin"))

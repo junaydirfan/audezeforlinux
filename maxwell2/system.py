@@ -20,6 +20,9 @@ KERNEL=="hidraw*", ATTRS{idVendor}=="3329", ATTRS{idProduct}=="4b29", TAG+="uacc
 # Maxwell 2 Direct USB-C Cable (3329:4B2A)
 KERNEL=="hidraw*", ATTRS{idVendor}=="3329", ATTRS{idProduct}=="4b2a", TAG+="uaccess", MODE="0666"
 
+# Maxwell 2 ANC USB Wireless Dongle (Xbox variant: 3329:4BA8)
+KERNEL=="hidraw*", ATTRS{idVendor}=="3329", ATTRS{idProduct}=="4ba8", TAG+="uaccess", MODE="0666"
+
 # Maxwell 1 legacy VID:PIDs
 KERNEL=="hidraw*", ATTRS{idVendor}=="3329", ATTRS{idProduct}=="4b18", TAG+="uaccess", MODE="0666"
 KERNEL=="hidraw*", ATTRS{idVendor}=="3329", ATTRS{idProduct}=="4b19", TAG+="uaccess", MODE="0666"
