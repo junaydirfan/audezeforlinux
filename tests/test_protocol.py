@@ -589,11 +589,12 @@ class TestFotaLiveHarness(unittest.TestCase):
                     engine.execute()
                 self.assertEqual(t.writes, [])
 
-        # The ANC Xbox dongle PID marks the device as ANC even when its version is a regular release.
-        engine, t = self._engine(transport=FakeFotaTransport(product_id=0x4BA8))
-        with self.assertRaisesRegex(FotaSafetyError, "track mismatch"):
-            engine.execute()
-        self.assertEqual(t.writes, [])
+        # The ANC dongle PIDs mark the device as ANC even when its version is a regular release.
+        for pid in (0x4BA8, 0x4BA9):
+            engine, t = self._engine(transport=FakeFotaTransport(product_id=pid))
+            with self.assertRaisesRegex(FotaSafetyError, "track mismatch"):
+                engine.execute()
+            self.assertEqual(t.writes, [])
 
         from maxwell2.firmware import FirmwarePackage, FotaEngine
         pkg = FirmwarePackage(self._write_package("AB1585_Headset", "Maxwell2_PS_headset_v1.0.5.7.4.bin"))
