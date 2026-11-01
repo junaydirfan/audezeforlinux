@@ -11,6 +11,7 @@ KERNEL=="hidraw*", ATTRS{idVendor}=="3329", ATTRS{idProduct}=="4b1e", TAG+="uacc
 KERNEL=="hidraw*", ATTRS{idVendor}=="3329", ATTRS{idProduct}=="4b28", TAG+="uaccess"
 KERNEL=="hidraw*", ATTRS{idVendor}=="3329", ATTRS{idProduct}=="4b29", TAG+="uaccess"
 KERNEL=="hidraw*", ATTRS{idVendor}=="3329", ATTRS{idProduct}=="4b2a", TAG+="uaccess"
+KERNEL=="hidraw*", ATTRS{idVendor}=="3329", ATTRS{idProduct}=="4b2e", TAG+="uaccess"
 
 # Maxwell 2 ANC
 KERNEL=="hidraw*", ATTRS{idVendor}=="3329", ATTRS{idProduct}=="4ba8", TAG+="uaccess"

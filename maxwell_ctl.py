@@ -341,6 +341,9 @@ def main():
 
             if args.command == "status":
                 status = client.get_status()
+                if not status["device_responding"]:
+                    print("[!] No response from the headset: the values below are defaults, not readings.\n"
+                          "    Check that it is powered on and linked to the dongle.", file=sys.stderr)
                 if args.json:
                     print(json.dumps(status, indent=2))
                 elif RICH_AVAILABLE and not args.plain and sys.stdout.isatty():

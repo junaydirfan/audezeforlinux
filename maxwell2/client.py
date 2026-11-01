@@ -167,42 +167,53 @@ class MaxwellClient:
     def get_status(self) -> Dict[str, Any]:
         """Collects full status information in one dictionary with per-field resilience."""
         status = {}
+        responded = False
 
         try:
             status["preset"] = self.get_preset()
+            responded = True
         except Exception:
             status["preset"] = {"index": 4, "name": "Immersive", "is_custom": False, "slot": None}
 
         try:
             status["battery_percent"] = self.get_battery()
+            responded = responded or status["battery_percent"] is not None
         except Exception:
             status["battery_percent"] = 90
 
         try:
             status["firmware"] = self.get_firmware()
+            responded = responded or status["firmware"]["firmware"] != "Unknown"
         except Exception:
             status["firmware"] = {"firmware": "v1.0.5.7.4", "dongle": "v1.0.5.7.4", "headset": "v1.0.5.7.4", "match": True}
 
         try:
             status["mic_muted"] = self.get_mic_mute()
+            responded = True
         except Exception:
             status["mic_muted"] = False
 
         try:
             status["sidetone"] = self.get_sidetone()
+            responded = True
         except Exception:
             status["sidetone"] = {"enabled": False, "level": 5, "max_level": 31}
 
         try:
             status["chat_mix"] = self.get_chat_mix()
+            responded = True
         except Exception:
             status["chat_mix"] = {"raw": 10, "game_pct": 50, "chat_pct": 50}
 
         try:
             status["noise_reduction"] = self.get_noise_reduction()
+            responded = True
         except Exception:
             status["noise_reduction"] = {"code": 1, "name": "Low"}
 
+        # Every field above falls back to a placeholder, so callers need this to
+        # tell real readings from defaults.
+        status["device_responding"] = responded
         return status
 
     # --------------------------------------------------------------------------

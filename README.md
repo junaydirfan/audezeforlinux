@@ -119,7 +119,7 @@ audezeforlinux dashboard
 | **Maxwell 2 (PlayStation / PC Dongle)** | `3329:4B29` | Wireless 2.4 GHz Dongle | Supported |
 | **Maxwell 2 (Direct USB-C)** | `3329:4B2A` | Direct USB Audio / HID | Supported |
 | **Maxwell 2 ANC (Xbox Dongle)** | `3329:4BA8` | Wireless 2.4 GHz Dongle | Detected (ID from [#3](https://github.com/junaydirfan/audezeforlinux/issues/3)); controls untested |
-| **Maxwell 2 ANC (PlayStation Dongle)** | `3329:4BA9` | Wireless 2.4 GHz Dongle | Detected (ID from [#4](https://github.com/junaydirfan/audezeforlinux/issues/4)); controls untested |
+| **Maxwell 2 ANC (PlayStation Dongle)** | `3329:4BA9` | Wireless 2.4 GHz Dongle | Detected (ID from [#4](https://github.com/junaydirfan/audezeforlinux/issues/4); ANC inferred from the ID, not yet confirmed); controls untested |
 | **Maxwell 2 ANC (Direct USB-C)** | Unknown | — | Device IDs needed ([open an issue](https://github.com/junaydirfan/audezeforlinux/issues) with your `lsusb` output) |
 | **Maxwell 1 (Xbox Dongle)** | `3329:4B18` | Wireless 2.4 GHz Dongle | Supported |
 | **Maxwell 1 (PlayStation Dongle)** | `3329:4B19` | Wireless 2.4 GHz Dongle | Supported |

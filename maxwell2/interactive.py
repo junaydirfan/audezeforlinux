@@ -12,6 +12,7 @@ import copy
 import time
 import json
 import threading
+from functools import wraps
 from typing import Optional, List, Dict, Any, Callable
 
 # Prevent escape sequence delay for arrow keys
@@ -60,6 +61,17 @@ DEFAULT_STATUS = {
 }
 
 
+def requires_hardware(action):
+    """Skips a hardware action while the background status load owns the transport."""
+    @wraps(action)
+    def guarded(self, *args, **kwargs):
+        if self.loading:
+            self.message = "Still reading headset status, try again in a moment."
+            return None
+        return action(self, *args, **kwargs)
+    return guarded
+
+
 class ClickableRegion:
     """Defines an interactive on-screen mouse-clickable bounding box."""
     def __init__(self, y: int, x1: int, x2: int, callback: Callable[[], None], desc: str = ""):
@@ -100,6 +112,8 @@ class CursesTUI:
         self.stdscr = stdscr
         self.client = client
         self.running = True
+        # True while the background thread is using the transport, which isn't thread-safe
+        self.loading = False
 
         # Active view:
         # 0 = Controls & Presets
@@ -204,6 +218,19 @@ class CursesTUI:
         except Exception:
             self.system_backups = []
 
+    def has_live_status(self) -> bool:
+        """False while self.status still holds defaults rather than headset readings."""
+        return not self.loading and self.status.get("device_responding") is not False
+
+    def no_response_message(self) -> str:
+        return "No response from headset: is it on and linked to the dongle? Press [r] to retry."
+
+    def sent_message(self, text: str) -> str:
+        """Fast writes aren't acknowledged, so don't claim success to a silent headset."""
+        if self.status.get("device_responding") is False:
+            return f"{text} (unconfirmed: headset not responding)"
+        return text
+
     def set_tab(self, tab_idx: int):
         """Switches active view tab cleanly."""
         self.active_tab = tab_idx % self.TOTAL_TABS
@@ -213,6 +240,7 @@ class CursesTUI:
     def run(self):
         """Main event loop."""
         self.init_curses_terminal()
+        self.loading = True
         self.message = "Reading headset status..."
         self.click_regions.clear()
         self.stdscr.erase()
@@ -225,9 +253,14 @@ class CursesTUI:
         def load_hardware_state():
             try:
                 self.load_initial_hardware_state()
-                self.message = "Hardware status loaded. Use Arrow Keys to navigate."
+                if self.status.get("device_responding") is False:
+                    self.message = self.no_response_message()
+                else:
+                    self.message = "Hardware status loaded. Use Arrow Keys to navigate."
             except Exception as e:
                 self.message = f"Hardware status notice: {e}"
+            finally:
+                self.loading = False
 
         hardware_thread = threading.Thread(target=load_hardware_state, daemon=True)
         hardware_thread.start()
@@ -308,7 +341,12 @@ class CursesTUI:
         safe_addstr(self.stdscr, 1, 0, "│", self.C_DIM)
         safe_addstr(self.stdscr, 1, 2, title_left, self.C_HEADER)
 
-        telemetry = f"FW: {fw}  •  Mic: {mic_tag}  •  Batt: {batt_bar} "
+        if self.loading:
+            telemetry = "Reading headset status... "
+        elif not self.has_live_status():
+            telemetry = "HEADSET NOT RESPONDING "
+        else:
+            telemetry = f"FW: {fw}  •  Mic: {mic_tag}  •  Batt: {batt_bar} "
         telemetry_x = max(len(title_left) + 4, max_x - len(telemetry) - 2)
         safe_addstr(self.stdscr, 1, telemetry_x, telemetry, self.C_NORMAL)
         safe_addstr(self.stdscr, 1, max_x - 1, "│", self.C_DIM)
@@ -346,7 +384,7 @@ class CursesTUI:
 
         for i, name in enumerate(PRESET_NAMES, 1):
             row_y = start_y + 1 + (i - 1)
-            is_active = (i == curr_idx)
+            is_active = (i == curr_idx) and self.has_live_status()
             is_cursor = (self.selected_row == i - 1)
 
             cursor_marker = " > " if is_cursor else "   "
@@ -829,17 +867,24 @@ class CursesTUI:
     # HARDWARE ACTIONS
     # ==========================================================================
 
+    @requires_hardware
     def activate_preset(self, preset_idx: int):
         """Activates a preset on hardware."""
+        self.selected_row = preset_idx - 1
         p_name = PRESET_NAMES[preset_idx - 1]
         self.message = f"Activating [{preset_idx}] {p_name} on hardware..."
         try:
             res = self.client.set_preset(preset_idx)
             self.status["preset"] = res["preset"]
+            self.status["device_responding"] = True
             self.message = f"✔ Preset switched to: [{preset_idx}] {p_name}"
+        except TimeoutError:
+            self.status["device_responding"] = False
+            self.message = self.no_response_message()
         except Exception as e:
             self.message = f"Preset activation error: {e}"
 
+    @requires_hardware
     def toggle_sidetone(self):
         """Toggles hardware sidetone on/off."""
         st = self.status.setdefault("sidetone", {"enabled": False, "level": 5, "max_level": 31})
@@ -848,10 +893,11 @@ class CursesTUI:
         st["enabled"] = new_val
         try:
             self.client.set_sidetone_fast(enabled=new_val)
-            self.message = f"Sidetone switched {'ON' if new_val else 'OFF'}."
+            self.message = self.sent_message(f"Sidetone switched {'ON' if new_val else 'OFF'}.")
         except Exception as e:
             self.message = f"Sidetone toggle failed: {e}"
 
+    @requires_hardware
     def step_sidetone(self, delta: int):
         """Adjusts sidetone volume smoothly (0..31)."""
         st = self.status.setdefault("sidetone", {"enabled": False, "level": 5, "max_level": 31})
@@ -860,10 +906,11 @@ class CursesTUI:
         st["level"] = new_lvl
         try:
             self.client.set_sidetone_fast(level=new_lvl)
-            self.message = f"Sidetone volume: {new_lvl}/31"
+            self.message = self.sent_message(f"Sidetone volume: {new_lvl}/31")
         except Exception as e:
             self.message = f"Sidetone volume failed: {e}"
 
+    @requires_hardware
     def step_chatmix(self, delta: int):
         """Adjusts game/chat balance smoothly (0..20)."""
         cm = self.status.setdefault("chat_mix", {"raw": 10, "game_pct": 50, "chat_pct": 50})
@@ -875,10 +922,11 @@ class CursesTUI:
         cm["game_pct"] = 100 - chat_p
         try:
             self.client.set_chat_mix_fast(new_raw)
-            self.message = f"Game/Chat Balance: {100 - chat_p}% Game / {chat_p}% Chat"
+            self.message = self.sent_message(f"Game/Chat Balance: {100 - chat_p}% Game / {chat_p}% Chat")
         except Exception as e:
             self.message = f"Chat mix failed: {e}"
 
+    @requires_hardware
     def cycle_noise_reduction(self, direction: int = 1):
         """Cycles AI noise reduction mode."""
         modes = ["Off", "Low", "High"]
@@ -889,10 +937,11 @@ class CursesTUI:
         nr["name"] = modes[new_code]
         try:
             self.client.set_noise_reduction_fast(new_code)
-            self.message = f"AI Noise Reduction set to {modes[new_code]}."
+            self.message = self.sent_message(f"AI Noise Reduction set to {modes[new_code]}.")
         except Exception as e:
             self.message = f"Noise reduction failed: {e}"
 
+    @requires_hardware
     def select_eq_slot(self, slot_idx: int):
         """Loads custom slot from hardware."""
         self.active_eq_slot = slot_idx
@@ -953,6 +1002,7 @@ class CursesTUI:
         self.eq_dirty = True
         self.message = f"Applied curve: '{target_name}'. Press 's' to write to headset."
 
+    @requires_hardware
     def save_custom_eq(self):
         """Saves current 10-band profile directly to headset hardware."""
         self.message = f"Saving Custom Preset {self.active_eq_slot + 1} to headset NVDM..."
@@ -977,13 +1027,17 @@ class CursesTUI:
         """Selects a release to view in the changelog browser."""
         self.fw_selected_release = rel_idx
 
+    @requires_hardware
     def refresh_telemetry(self):
         """Re-reads telemetry from headset."""
         try:
             live = self.client.get_status()
             self.status.update(live)
             self.system_backups = list_backups()
-            self.message = "Telemetry refreshed from headset."
+            if live.get("device_responding") is False:
+                self.message = self.no_response_message()
+            else:
+                self.message = "Telemetry refreshed from headset."
         except Exception as e:
             self.message = f"Refresh note: {e}"
 

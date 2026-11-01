@@ -25,7 +25,7 @@ from maxwell2.protocol import (
 )
 
 AUDEZE_VID = 0x3329
-KNOWN_PIDS = [0x4B18, 0x4B19, 0x4B1A, 0x4B1E, 0x4B28, 0x4B29, 0x4B2A, 0x4BA8, 0x4BA9]
+KNOWN_PIDS = [0x4B18, 0x4B19, 0x4B1A, 0x4B1E, 0x4B28, 0x4B29, 0x4B2A, 0x4B2E, 0x4BA8, 0x4BA9]
 DONGLE_PIDS = [0x4B18, 0x4B19, 0x4B28, 0x4B29, 0x4BA8, 0x4BA9]
 # Maxwell 2 ANC units. The Xbox dongle (4BA8) was reported in issue #3 and the PlayStation
 # dongle (4BA9) in issue #4; the USB-C ID is still unknown.
@@ -61,6 +61,7 @@ def list_maxwell_devices() -> List[dict]:
         0x4B28: "Maxwell 2 (Xbox Dongle)",
         0x4B29: "Maxwell 2 (PlayStation / PC Dongle)",
         0x4B2A: "Maxwell 2 (Direct USB)",
+        0x4B2E: "Maxwell 2 (Xbox Direct USB)",
         0x4BA8: "Maxwell 2 ANC (Xbox Dongle)",
         0x4BA9: "Maxwell 2 ANC (PlayStation Dongle)",
         0x4B18: "Maxwell 1 (Xbox Dongle)",
@@ -119,7 +120,8 @@ class Transport:
         """
         devices = list_maxwell_devices()
         if devices:
-            d = devices[0]
+            # A headset on USB-C can be reached without the wireless link, so prefer it.
+            d = next((dev for dev in devices if not dev["is_dongle"]), devices[0])
             return d["path"], d["pid"], d["is_dongle"]
 
         raise DeviceNotFoundError(
@@ -135,6 +137,11 @@ class Transport:
 
         if not self.hidraw_path:
             self.hidraw_path, self.product_id, self.is_dongle = self.find_device()
+        else:
+            # An explicit --device still needs the right route byte for that hardware.
+            for dev in list_maxwell_devices():
+                if dev["path"] == self.hidraw_path:
+                    self.product_id, self.is_dongle = dev["pid"], dev["is_dongle"]
 
         if not os.path.exists(self.hidraw_path):
             raise DeviceNotFoundError(f"Device node {self.hidraw_path} does not exist.")

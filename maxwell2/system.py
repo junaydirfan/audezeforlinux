@@ -19,6 +19,7 @@ KERNEL=="hidraw*", ATTRS{idVendor}=="3329", ATTRS{idProduct}=="4b29", TAG+="uacc
 
 # Maxwell 2 Direct USB-C Cable (3329:4B2A)
 KERNEL=="hidraw*", ATTRS{idVendor}=="3329", ATTRS{idProduct}=="4b2a", TAG+="uaccess", MODE="0666"
+KERNEL=="hidraw*", ATTRS{idVendor}=="3329", ATTRS{idProduct}=="4b2e", TAG+="uaccess", MODE="0666"
 
 # Maxwell 2 ANC USB Wireless Dongle (Xbox variant: 3329:4BA8, PlayStation variant: 3329:4BA9)
 KERNEL=="hidraw*", ATTRS{idVendor}=="3329", ATTRS{idProduct}=="4ba8", TAG+="uaccess", MODE="0666"
