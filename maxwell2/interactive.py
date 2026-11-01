@@ -212,6 +212,14 @@ class CursesTUI:
     def run(self):
         """Main event loop."""
         self.init_curses_terminal()
+        self.message = "Reading headset status..."
+        self.click_regions.clear()
+        self.stdscr.erase()
+        try:
+            self.render()
+        except Exception as e:
+            safe_addstr(self.stdscr, 1, 2, f"Render notice: {e}", self.C_WARN)
+        self.stdscr.refresh()
         self.load_initial_hardware_state()
 
         while self.running:
