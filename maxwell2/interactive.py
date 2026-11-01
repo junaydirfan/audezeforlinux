@@ -11,6 +11,7 @@ import sys
 import copy
 import time
 import json
+import threading
 from typing import Optional, List, Dict, Any, Callable
 
 # Prevent escape sequence delay for arrow keys
@@ -220,7 +221,20 @@ class CursesTUI:
         except Exception as e:
             safe_addstr(self.stdscr, 1, 2, f"Render notice: {e}", self.C_WARN)
         self.stdscr.refresh()
-        self.load_initial_hardware_state()
+
+        hardware_load_done = threading.Event()
+
+        def load_hardware_state():
+            try:
+                self.load_initial_hardware_state()
+                self.message = "Hardware status loaded. Use Arrow Keys to navigate."
+            except Exception as e:
+                self.message = f"Hardware status notice: {e}"
+            finally:
+                hardware_load_done.set()
+
+        hardware_thread = threading.Thread(target=load_hardware_state, daemon=True)
+        hardware_thread.start()
 
         while self.running:
             self.click_regions.clear()
@@ -234,9 +248,15 @@ class CursesTUI:
             try:
                 ch = self.stdscr.getch()
             except KeyboardInterrupt:
+                self.running = False
                 break
 
             if ch == -1:
+                continue
+
+            if not hardware_load_done.is_set():
+                if ch in (ord('q'), ord('Q'), 27):
+                    self.running = False
                 continue
 
             try:
@@ -1015,5 +1035,7 @@ def run_interactive_dashboard(client: MaxwellClient):
 
     try:
         curses.wrapper(_curses_main)
+    except KeyboardInterrupt:
+        pass
     except Exception as e:
         print(f"[-] Interactive dashboard notice: {e}")
