@@ -1,12 +1,15 @@
 import unittest
 import threading
+import curses
 
 from maxwell2.interactive import CursesTUI
 
 
 class FakeScreen:
-    def __init__(self, events):
+    def __init__(self, events, keys=None, before_input=None):
         self.events = events
+        self.keys = iter(keys or [ord("q")])
+        self.before_input = before_input
 
     def erase(self):
         self.events.append("erase")
@@ -15,15 +18,18 @@ class FakeScreen:
         self.events.append("refresh")
 
     def getch(self):
-        return ord("q")
+        if self.before_input:
+            self.before_input.wait(timeout=2)
+        return next(self.keys)
 
 
 class InteractiveStartupTests(unittest.TestCase):
-    def test_dashboard_can_quit_while_hardware_state_loads(self):
+    def test_dashboard_navigates_and_quits_while_hardware_state_loads(self):
         events = []
         load_started = threading.Event()
         finish_load = threading.Event()
-        tui = CursesTUI(FakeScreen(events), client=None)
+        screen = FakeScreen(events, [curses.KEY_DOWN, ord("q")], load_started)
+        tui = CursesTUI(screen, client=None)
         tui.init_curses_terminal = lambda: events.append("init")
 
         def render():
@@ -40,6 +46,7 @@ class InteractiveStartupTests(unittest.TestCase):
             tui.run()
             self.assertTrue(load_started.is_set())
             self.assertFalse(tui.running)
+            self.assertEqual(tui.selected_row, 1)
             self.assertLess(events.index(("render", "Reading headset status...")), events.index("refresh"))
         finally:
             finish_load.set()

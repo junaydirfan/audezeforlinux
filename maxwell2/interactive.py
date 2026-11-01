@@ -222,16 +222,12 @@ class CursesTUI:
             safe_addstr(self.stdscr, 1, 2, f"Render notice: {e}", self.C_WARN)
         self.stdscr.refresh()
 
-        hardware_load_done = threading.Event()
-
         def load_hardware_state():
             try:
                 self.load_initial_hardware_state()
                 self.message = "Hardware status loaded. Use Arrow Keys to navigate."
             except Exception as e:
                 self.message = f"Hardware status notice: {e}"
-            finally:
-                hardware_load_done.set()
 
         hardware_thread = threading.Thread(target=load_hardware_state, daemon=True)
         hardware_thread.start()
@@ -252,11 +248,6 @@ class CursesTUI:
                 break
 
             if ch == -1:
-                continue
-
-            if not hardware_load_done.is_set():
-                if ch in (ord('q'), ord('Q'), 27):
-                    self.running = False
                 continue
 
             try:
