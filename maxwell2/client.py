@@ -14,12 +14,20 @@ from maxwell2.protocol import (
     build_read_control_command,
     build_write_control_command,
     build_read_ui_eq_command,
+    build_read_coefficients_command,
     build_write_ui_eq_command,
+    build_write_coefficients_command,
+    build_coefficient_blob,
+    validate_coefficient_blob,
     parse_preset_index,
     parse_battery_notification,
     parse_firmware_notification,
     parse_control_response,
     parse_ui_eq_preset,
+    parse_coefficient_blob,
+    parse_nvdm_write_ack,
+    KEY_COEFF_BASE,
+    KEY_UI_BASE,
     SUB_MIC_MUTE,
     SUB_NOISE_REDUCTION,
     SUB_SIDETONE_LEVEL,
@@ -31,6 +39,8 @@ from maxwell2.protocol import (
 )
 from maxwell2.transport import Transport
 from maxwell2.backup import create_backup, load_backup
+
+COEFFICIENT_READ_ATTEMPTS = 6
 
 
 class MaxwellClient:
@@ -234,27 +244,83 @@ class MaxwellClient:
 
         return parse_ui_eq_preset(resp, expected_slot=slot)
 
+    def read_coefficients(self, slot: int) -> bytes:
+        """Reads a slot's 844-byte DSP coefficients, skipping late replies to earlier requests."""
+        last_error: Optional[Exception] = None
+        for _ in range(COEFFICIENT_READ_ATTEMPTS):
+            try:
+                resp = self.transport.exchange(build_read_coefficients_command(slot), timeout_sec=4.0)
+                return parse_coefficient_blob(resp, slot)
+            except (ProtocolError, TimeoutError) as e:
+                last_error = e
+        raise RuntimeError(f"Could not read EQ coefficients for slot {slot}: {last_error}")
+
+    def _write_coefficients(self, slot: int, blob: bytes) -> None:
+        """Writes a slot's DSP coefficients and confirms them by reading them back."""
+        resp = self.transport.exchange(build_write_coefficients_command(slot, blob), timeout_sec=6.0)
+        parse_nvdm_write_ack(resp, KEY_COEFF_BASE + slot)
+        time.sleep(0.3)
+        if self.read_coefficients(slot) != blob:
+            raise RuntimeError(f"EQ coefficients for slot {slot} did not verify after writing")
+
+    def _reload_preset(self, preset_idx: int) -> None:
+        """Selects a preset, moving off it first so the DSP loads the new coefficients."""
+        if self.get_preset()["index"] == preset_idx:
+            other = 7 + (preset_idx - 7 + 1) % 4
+            self.transport.write_race_packet(build_select_preset_command(other))
+            time.sleep(0.15)
+            self.transport.poll_input_report()
+
+        self.transport.write_race_packet(build_select_preset_command(preset_idx))
+        time.sleep(0.15)
+        self.transport.poll_input_report()
+
+        active = self.get_preset()["index"]
+        if active != preset_idx:
+            raise RuntimeError(f"Preset change verification failed: expected {preset_idx}, got {active}")
+
     def write_custom_eq(self, slot: int, bands: List[Dict[str, Any]], activate: bool = True) -> Dict[str, Any]:
         """
-        Writes a 10-band custom EQ profile to NVDM key 0xEF00 + slot (slot 0..3).
-        Takes a pre-write backup snapshot before sending the write.
-        Optionally activates the custom preset so the DSP reloads the new curve.
+        Saves a 10-band custom EQ to a slot (0..3): the DSP coefficients that shape the sound
+        (NVDM key 0xE42C + slot) and the slider record the UI reads back (0xEF00 + slot).
+        Takes a pre-write backup snapshot, restores the coefficients if the save fails, and
+        optionally activates the custom preset so the DSP loads the new curve.
         """
         if not (0 <= slot <= 3):
             raise ValueError(f"Custom EQ slot must be 0..3 (representing Presets 1..4), got {slot}")
 
+        # Build first, so that invalid bands are refused before the device is touched
+        blob = build_coefficient_blob(bands)
+        ui_cmd = build_write_ui_eq_command(slot, bands)
+
         # 1. Snapshot previous state
         current = self.read_custom_eq(slot)
-        backup_path = create_backup(f"write_custom_eq_slot_{slot+1}", {"previous_eq": current, "target_bands": bands})
+        previous_blob = None if self.transport.dry_run else self.read_coefficients(slot)
+        if previous_blob is not None:
+            validate_coefficient_blob(previous_blob)
+        backup_path = create_backup(
+            f"write_custom_eq_slot_{slot+1}",
+            {
+                "previous_eq": current,
+                "previous_coefficients_hex": previous_blob.hex() if previous_blob else None,
+                "target_bands": bands,
+            },
+        )
 
-        # 2. Build and send write command
-        cmd = build_write_ui_eq_command(slot, bands)
-        self.transport.write_race_packet(cmd)
+        if self.transport.dry_run:
+            self.transport.write_race_packet(build_write_coefficients_command(slot, blob))
+            self.transport.write_race_packet(ui_cmd)
+        else:
+            # 2. Write the DSP curve, then the sliders, undoing the curve if either step fails
+            try:
+                self._write_coefficients(slot, blob)
+                parse_nvdm_write_ack(self.transport.exchange(ui_cmd, timeout_sec=3.0), KEY_UI_BASE + slot)
+            except Exception:
+                self._write_coefficients(slot, previous_blob)
+                raise
 
-        if not self.transport.dry_run and activate:
-            # Re-select custom preset (Preset 7..10) so the DSP reloads the updated curve
-            preset_idx = 7 + slot
-            self.transport.write_race_packet(build_select_preset_command(preset_idx))
+            if activate:
+                self._reload_preset(7 + slot)
 
         return {
             "success": True,
@@ -289,6 +355,9 @@ class MaxwellClient:
         Takes a pre-write backup snapshot before sending the write.
         """
         # Resolve target index
+        if isinstance(target, str) and target.strip().isdigit():
+            target = int(target)
+
         if isinstance(target, str):
             target_clean = target.strip().lower()
             matched_idx = None
