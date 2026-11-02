@@ -365,6 +365,15 @@ def main():
 
             elif args.command == "eq" and args.eq_action == "custom":
                 slot_idx = args.slot - 1  # 0..3
+                if args.file:
+                    with open(args.file, "r", encoding="utf-8") as f:
+                        profile = json.load(f)
+                    res = client.write_custom_eq(slot_idx, profile["bands"])
+                    dry = " [DRY-RUN]" if res.get("dry_run") else ""
+                    print(f"[+] Saved and activated Custom Preset {args.slot}{dry}")
+                    print(f"    Backup saved to: {res['backup_file']}")
+                    return
+
                 eq_data = client.read_custom_eq(slot_idx)
 
                 if args.export:

@@ -161,7 +161,7 @@ The Audeze Maxwell stores custom EQ in Non-Volatile Device Memory (NVDM) across 
 - **Example (Read Custom 1 DSP)**: `05 5A 06 00 0C 0A 2C E4 E8 03` (key `0xE42C`, max 1000 bytes)
 - **Response Format**: `05 5B <len_le16> 0C 0A <status> <key_le16> <data_len_le16> <data...>`
 
-#### Write NVDM Key (Opcode `0x0A0D`) [CONFIRMED on Maxwell 1 / HYPOTHESIS on Maxwell 2]
+#### Write NVDM Key (Opcode `0x0A0D`) [CONFIRMED]
 - **Request Format**: `05 5A <len_le16> 0D 0A <key_le16> <data...>`
 - **Response Format**: `05 5B 05 00 0D 0A <status> <key_le16>`
 
@@ -201,11 +201,25 @@ Standard 10 Graphic Bands:
 9. 8000 Hz (8 kHz)
 10. 16000 Hz (16 kHz)
 
-#### 2. DSP Biquad Coefficients (`0xE42C + slot`) [CONFIRMED on Maxwell 1 / HYPOTHESIS on Maxwell 2]
-Fixed size: **844 bytes**.
-Contains biquad filter coefficients computed for 4 discrete sample rates:
-1. 44.1 kHz
-2. 48.0 kHz
-3. 88.2 kHz
-4. 96.0 kHz
-Each biquad stage uses 24-bit fixed point coefficients with stage fractional bits 23/22/23/22/23 and global gain scale 2^18.
+#### 2. DSP Biquad Coefficients (`0xE42C + slot`) [CONFIRMED on Maxwell 2 3329:4B28]
+This record is what shapes the sound: writing only the slider record changes nothing audible. A flat record regenerated from the layout below matches the device byte for byte.
+
+Fixed size: **844 bytes**: header `04 00 00 00`, then one 210-byte block per sample rate.
+
+| Rate ID | Sample rate |
+|---|---|
+| `1` | 44.1 kHz |
+| `2` | 48.0 kHz |
+| `5` | 88.2 kHz |
+| `6` | 96.0 kHz |
+
+Each block holds:
+- `u16` rate ID, `u16` `0x0067`, `u16` stage count (10)
+- 10 stages of 5 words (`b0 b1 b2 a1 a2`, `a0` = 1), with 23/22/23/22/23 fractional bits
+- 1 gain word with 18 fractional bits
+
+Each word is a signed 24-bit value stored in 4 bytes as `mid hi 00 lo`. For example, `ff 7f 00 ff` is `0x7FFFFF`, which is 1.0 with 23 fractional bits.
+
+The stages are RBJ peaking filters at the 10 graphic band centers with Q = 2. The slider record's `q` field is the bandwidth in Hz (f/2), not the filter Q. In a flat record, stage 0's numerator is scaled by 1/1.19 and the gain word is 1.19, so the net level is 0 dB. Curves that boost must be lowered as a whole, and numerators that overflow the word range are scaled down and made up in the gain word.
+
+Other keys seen on Maxwell 2: `0xE42A` is an 844-byte non-flat curve, and `0xE429` and `0xE42B` are 124-byte one-stage records in the same format. Their purpose is unknown, and they don't change with the active preset. The factory presets' filters are not in this key range.
