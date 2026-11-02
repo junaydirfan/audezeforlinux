@@ -151,10 +151,11 @@ audezeforlinux eq preset "Immersive"
 audezeforlinux eq preset 3
 
 # Read custom EQ curve from hardware Slot 1
-audezeforlinux eq get 1
+audezeforlinux eq custom 1
 
-# Apply a custom 10-band curve to hardware Slot 1 (32Hz to 16kHz)
-audezeforlinux eq set 1 "2.5, 1.5, 0.0, -1.0, 0.5, 1.0, 2.0, 3.0, 1.5, 0.0"
+# Export Slot 1, edit the gain_db values, then save and activate the curve
+audezeforlinux eq custom 1 --export curve.json
+audezeforlinux eq custom 1 --file curve.json
 ```
 
 ### 3. Hardware Audio Controls
