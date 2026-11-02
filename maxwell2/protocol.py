@@ -4,6 +4,8 @@ Implements the Airoha RACE protocol over 62-byte USB HID reports.
 Strictly verified and validated against safety allowlists.
 """
 
+import cmath
+import math
 import struct
 from typing import List, Tuple, Optional, Dict, Any
 
@@ -70,6 +72,18 @@ PRESET_NAMES = [
 KEY_UI_BASE = 0xEF00         # 0xEF00..0xEF03 for custom slots 0..3
 KEY_COEFF_BASE = 0xE42C      # 0xE42C..0xE42F for custom slots 0..3
 COEFFICIENT_BLOB_SIZE = 844
+COEFFICIENT_BLOCK_SIZE = 210
+COEFFICIENT_HEADER = b"\x04\x00\x00\x00"
+
+# Custom EQ DSP filter design, matching the flat records the headset ships with
+EQ_BAND_FREQS = (32, 64, 125, 250, 500, 1000, 2000, 4000, 8000, 16000)
+EQ_SAMPLE_RATES = ((1, 44100), (2, 48000), (5, 88200), (6, 96000))  # (block rate id, Hz)
+EQ_BLOCK_TYPE = 0x0067
+EQ_FILTER_Q = 2.0
+EQ_OUTPUT_GAIN = 1.19
+EQ_FRAC_BITS = (23, 22, 23, 22, 23)  # b0, b1, b2, a1, a2
+EQ_GAIN_FRAC_BITS = 18
+EQ_RESPONSE_POINTS = 400
 
 # Safety limits
 MAX_CHAT_MIX = 20
@@ -287,9 +301,132 @@ def build_write_ui_eq_command(slot: int, bands: List[Dict[str, Any]], header: Op
     return build_race_packet(CMD_NVDM_WRITE, struct.pack("<H", key) + bytes(raw_payload))
 
 
+def _encode_coefficient(value: float, frac_bits: int) -> bytes:
+    """Encodes a signed 24-bit fixed-point word in the device's `mid hi 00 lo` byte order."""
+    scaled = round(value * (1 << frac_bits))
+    if not -(1 << 23) <= scaled <= (1 << 23):
+        raise ProtocolError(f"Coefficient {value} out of range for {frac_bits} fractional bits")
+    word = min(scaled, (1 << 23) - 1) & 0xFFFFFF  # exactly +1.0 saturates, as on the device
+    return struct.pack("<HH", word >> 8, (word & 0xFF) << 8)
+
+
+def _peaking_biquad(freq: float, sample_rate: int, gain_db: float) -> Tuple[float, ...]:
+    """RBJ peaking filter, normalised to a0 = 1. Returns (b0, b1, b2, a1, a2)."""
+    amp = 10 ** (gain_db / 40)
+    omega = 2 * math.pi * freq / sample_rate
+    alpha = math.sin(omega) / (2 * EQ_FILTER_Q)
+    a0 = 1 + alpha / amp
+    return (
+        (1 + alpha * amp) / a0,
+        -2 * math.cos(omega) / a0,
+        (1 - alpha * amp) / a0,
+        -2 * math.cos(omega) / a0,
+        (1 - alpha / amp) / a0,
+    )
+
+
+def _cascade_peak_db(stages: List[Tuple[float, ...]], sample_rate: int) -> float:
+    """Highest level (dB) of the cascaded response between 20 Hz and 20 kHz."""
+    peak = 0.0
+    for step in range(EQ_RESPONSE_POINTS):
+        freq = 20 * 1000 ** (step / (EQ_RESPONSE_POINTS - 1))
+        z = cmath.exp(-2j * math.pi * freq / sample_rate)
+        level = 1.0
+        for b0, b1, b2, a1, a2 in stages:
+            level *= abs((b0 + b1 * z + b2 * z * z) / (1 + a1 * z + a2 * z * z))
+        peak = max(peak, level)
+    return 20 * math.log10(peak)
+
+
+def build_coefficient_blob(bands: List[Dict[str, Any]]) -> bytes:
+    """
+    Builds the 844-byte DSP coefficient record for a custom slot (key 0xE42C + slot).
+
+    Layout: 4-byte header, then one 210-byte block per sample rate holding a 6-byte block header,
+    10 biquad stages and a gain word. Curves that boost are lowered as a whole so the peak sits
+    at 0 dB, because the DSP has no headroom above full scale.
+    """
+    if len(bands) != 10:
+        raise ProtocolError(f"EQ must contain exactly 10 bands, got {len(bands)}")
+
+    gains = []
+    for i, band in enumerate(bands):
+        gain = float(band.get("gain_db", 0.0))
+        if not -12.0 <= gain <= 12.0:
+            raise ProtocolError(f"Band {i+1} gain out of range (-12..+12 dB): {gain}")
+        gains.append(gain)
+
+    blob = bytearray(COEFFICIENT_HEADER)
+    for rate_id, sample_rate in EQ_SAMPLE_RATES:
+        stages = [_peaking_biquad(f, sample_rate, g) for f, g in zip(EQ_BAND_FREQS, gains)]
+        output_gain = EQ_OUTPUT_GAIN * 10 ** (-max(_cascade_peak_db(stages, sample_rate), 0.0) / 20)
+
+        blob += struct.pack("<HHH", rate_id, EQ_BLOCK_TYPE, len(stages))
+        for index, (b0, b1, b2, a1, a2) in enumerate(stages):
+            # b0 and b2 can only hold values below 1 and b1 below 2, so strong boosts are scaled
+            # down here and made up in the gain word. Stage 0 also carries the fixed pre-gain.
+            overflow = max(abs(b0), abs(b2), abs(b1) / 2, 1.0)
+            scale = 1 / overflow
+            output_gain *= overflow
+            if index == 0:
+                scale /= EQ_OUTPUT_GAIN
+            for value, frac_bits in zip((b0 * scale, b1 * scale, b2 * scale, a1, a2), EQ_FRAC_BITS):
+                blob += _encode_coefficient(value, frac_bits)
+        blob += _encode_coefficient(output_gain, EQ_GAIN_FRAC_BITS)
+
+    return bytes(blob)
+
+
+def validate_coefficient_blob(blob: bytes) -> None:
+    """Refuses a record that doesn't have the layout build_coefficient_blob() generates."""
+    if len(blob) != COEFFICIENT_BLOB_SIZE or blob[:4] != COEFFICIENT_HEADER:
+        raise ProtocolError(f"Unrecognised EQ coefficient record ({len(blob)} bytes)")
+    for index, (rate_id, _) in enumerate(EQ_SAMPLE_RATES):
+        block = struct.unpack_from("<HHH", blob, 4 + index * COEFFICIENT_BLOCK_SIZE)
+        if block != (rate_id, EQ_BLOCK_TYPE, len(EQ_BAND_FREQS)):
+            raise ProtocolError(f"Unrecognised EQ coefficient block {index}: {block}")
+
+
+def build_write_coefficients_command(slot: int, blob: bytes) -> bytes:
+    """Builds the NVDM write packet for a slot's DSP coefficients (key 0xE42C + slot)."""
+    if not (0 <= slot <= 3):
+        raise ProtocolError(f"Custom EQ slot must be 0..3, got {slot}")
+    validate_coefficient_blob(blob)
+    return build_race_packet(CMD_NVDM_WRITE, struct.pack("<H", KEY_COEFF_BASE + slot) + blob)
+
+
 # ==============================================================================
 # Response Parsers
 # ==============================================================================
+
+def parse_nvdm_write_ack(packet: bytes, expected_key: int) -> None:
+    """Checks the reply to an NVDM write and raises unless the device accepted that key."""
+    cmd, payload = parse_race_packet(packet, expected_dir=DIRECTION_RESPONSE)
+    if cmd != CMD_NVDM_WRITE or len(payload) < 3:
+        raise ProtocolError(f"Invalid NVDM write reply: cmd 0x{cmd:04X}, len {len(payload)}")
+    status, key = struct.unpack_from("<BH", payload, 0)
+    if key != expected_key:
+        raise ProtocolError(f"NVDM write key mismatch: expected 0x{expected_key:04X}, got 0x{key:04X}")
+    if status != 0:
+        raise ProtocolError(f"Device rejected NVDM write to 0x{key:04X}: status {status}")
+
+
+def parse_coefficient_blob(packet: bytes, expected_slot: int) -> bytes:
+    """Parses a coefficient read and returns the record. Replies for another key raise."""
+    cmd, payload = parse_race_packet(packet, expected_dir=DIRECTION_RESPONSE)
+    if cmd != CMD_NVDM_READ or len(payload) < 5:
+        raise ProtocolError(f"Expected NVDM read reply (0x0A0C), got 0x{cmd:04X}")
+    status, key, data_len = struct.unpack_from("<BHH", payload, 0)
+    expected_key = KEY_COEFF_BASE + expected_slot
+    if key != expected_key:
+        raise ProtocolError(f"Key mismatch: expected 0x{expected_key:04X}, got 0x{key:04X}")
+    if status != 0:
+        raise ProtocolError(f"Device reported error status reading coefficients: {status}")
+    data = payload[5:]
+    if len(data) != data_len:
+        raise ProtocolError(f"Coefficient length mismatch: declared {data_len}, got {len(data)}")
+    return bytes(data)
+
 
 def parse_preset_index(packet: bytes) -> Dict[str, Any]:
     """Parses response from read preset index command."""

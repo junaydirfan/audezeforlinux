@@ -3,6 +3,8 @@ Immersive Studio Grayscale / Monochrome terminal UI components for Audeze Maxwel
 Designed with a sleek, minimalist, high-contrast aesthetic.
 """
 
+from __future__ import annotations
+
 import sys
 from typing import Dict, Any, List, Optional
 
