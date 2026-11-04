@@ -12,7 +12,7 @@ import argparse
 from typing import Optional
 
 from maxwell2.transport import Transport, DeviceNotFoundError, DevicePermissionError
-from maxwell2.client import MaxwellClient
+from maxwell2.client import MaxwellClient, describe_battery
 from maxwell2.protocol import PRESET_NAMES
 from maxwell2.backup import list_backups, load_backup
 
@@ -41,9 +41,7 @@ def format_plain_status(status: dict) -> str:
     p_custom = " (Custom Slot " + str(preset.get("slot") + 1) + ")" if preset.get("is_custom") else ""
     lines.append(f"  Active Preset      : [{p_idx}] {p_name}{p_custom}")
 
-    batt = status.get("battery_percent")
-    batt_str = f"{batt}%" if batt is not None else "Unknown / Disconnected"
-    lines.append(f"  Battery Level      : {batt_str}")
+    lines.append(f"  Battery Level      : {describe_battery(status)}")
 
     fw = status.get("firmware", {}).get("firmware", "Unknown")
     lines.append(f"  Firmware Version   : {fw}")

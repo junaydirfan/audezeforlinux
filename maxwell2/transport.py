@@ -9,9 +9,12 @@ import os
 import sys
 import glob
 import time
+import errno
 import fcntl
 import struct
 import select
+import threading
+from functools import wraps
 from typing import Optional, List, Tuple
 
 from maxwell2.protocol import (
@@ -40,6 +43,19 @@ IOC_TYPE_H = 72  # ord('H')
 def _HIDIOCGINPUT(length: int) -> int:
     return (IOC_READ_WRITE << 30) | (length << 16) | (IOC_TYPE_H << 8) | 0x0A
 
+
+# Errors a write gets once the hidraw node has gone away. The headset and dongle both
+# re-enumerate (with new /dev/hidrawN numbers) when the headset is switched on or off.
+DEVICE_GONE_ERRNOS = (errno.ENODEV, errno.EIO, errno.EBADF, errno.ENOENT, errno.EPIPE, errno.ESHUTDOWN)
+
+
+def _locked(method):
+    """Serialises access to the device, so a background poll can't interleave with a request."""
+    @wraps(method)
+    def guarded(self, *args, **kwargs):
+        with self.lock:
+            return method(self, *args, **kwargs)
+    return guarded
 
 class DeviceNotFoundError(Exception):
     """Raised when no compatible Audeze Maxwell device node is found."""
@@ -106,6 +122,9 @@ class Transport:
     def __init__(self, hidraw_path: Optional[str] = None, dry_run: bool = False):
         self.dry_run = dry_run
         self.hidraw_path = hidraw_path
+        # A path given with --device is kept across reconnects while it still exists
+        self.explicit_path = hidraw_path is not None
+        self.lock = threading.RLock()
         self.fd: Optional[int] = None
         self.is_dongle = True
         self.product_id: Optional[int] = None
@@ -169,6 +188,16 @@ class Transport:
                 pass
             self.fd = None
 
+    @_locked
+    def reconnect(self):
+        """Reopens the device after it re-enumerated, picking it up again under its new node."""
+        self.close()
+        # Node numbers get reused after re-enumeration, so only keep a path still held by a Maxwell
+        still_maxwell = any(dev["path"] == self.hidraw_path for dev in list_maxwell_devices())
+        if not (self.explicit_path and still_maxwell):
+            self.hidraw_path = None
+        self.open()
+
     def __enter__(self):
         self.open()
         return self
@@ -176,8 +205,13 @@ class Transport:
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
 
-    def drain(self, max_rounds: int = 5):
-        """Drains stale input reports from both GET_REPORT and Interrupt IN buffers."""
+    @_locked
+    def drain(self, max_rounds: int = 64):
+        """
+        Drains stale input reports from both GET_REPORT and Interrupt IN buffers, until two
+        rounds in a row come back empty. Late replies to earlier requests can pile up in the
+        dongle, and a leftover battery notification would otherwise be read as the current level.
+        """
         self.input_stream.clear()
         self.pending_notifications.clear()
         if self.dry_run or self.fd is None:
@@ -212,6 +246,7 @@ class Transport:
                     break
             time.sleep(0.005)
 
+    @_locked
     def write_control_fast(self, subcommand: int, value: int):
         """
         Fast low-latency write for interactive sliders (sidetone, chatmix, noise reduction).
@@ -224,16 +259,19 @@ class Transport:
             time.sleep(0.012)
             self.poll_input_report()
 
-    def write_race_packet(self, race_packet: bytes, is_dongle: Optional[bool] = None) -> List[bytes]:
+    @_locked
+    def write_race_packet(self, race_packet: bytes, is_dongle: Optional[bool] = None,
+                          reconnect: bool = True) -> List[bytes]:
         """
         Frames and transmits a RACE packet over HID output reports (Report ID 0x06).
         is_dongle overrides the route for this packet only (True = 0x80 relay, False = 0x00).
+        If the device node has disappeared (headset switched on/off, cable replugged), the
+        device is reopened once and the packet sent again, unless reconnect is False: a firmware
+        transfer must stop rather than carry on against a device that has just rebooted.
         In dry-run mode, prints the outgoing report bytes and returns them.
         """
-        route_flag = self.is_dongle if is_dongle is None else is_dongle
-        reports = frame_output_reports(race_packet, is_dongle=route_flag)
-
         if self.dry_run:
+            reports = frame_output_reports(race_packet, is_dongle=self.is_dongle if is_dongle is None else is_dongle)
             print(f"[DRY-RUN] Sending RACE packet ({len(race_packet)} bytes):")
             print(f"  RACE Raw: {race_packet.hex(' ')}")
             for idx, rep in enumerate(reports):
@@ -243,13 +281,26 @@ class Transport:
         if self.fd is None:
             raise RuntimeError("Transport is not open.")
 
+        try:
+            return self._write_reports(race_packet, is_dongle)
+        except OSError as e:
+            if not reconnect or e.errno not in DEVICE_GONE_ERRNOS:
+                raise
+        # The route is re-read after reconnecting: the headset may now be on USB-C or the dongle.
+        # A packet split over several reports may have been half sent, so it is resent whole.
+        self.reconnect()
+        return self._write_reports(race_packet, is_dongle)
+
+    def _write_reports(self, race_packet: bytes, is_dongle: Optional[bool]) -> List[bytes]:
+        route_flag = self.is_dongle if is_dongle is None else is_dongle
+        reports = frame_output_reports(race_packet, is_dongle=route_flag)
         for rep in reports:
             written = os.write(self.fd, rep)
             if written != len(rep):
                 raise IOError(f"Incomplete HID write: {written}/{len(rep)} bytes")
-
         return reports
 
+    @_locked
     def poll_input_report(self) -> Optional[bytes]:
         """Polls one input report via HIDIOCGINPUT or Interrupt IN."""
         if self.dry_run or self.fd is None:
@@ -276,6 +327,7 @@ class Transport:
 
         return None
 
+    @_locked
     def read_race_packets(self, timeout_sec: float = 1.0) -> List[bytes]:
         """
         Polls incoming HID reports and returns all reassembled complete RACE packets.
@@ -297,12 +349,13 @@ class Transport:
 
         return packets
 
+    @_locked
     def exchange(self, race_packet: bytes, timeout_sec: float = 1.5) -> Optional[bytes]:
         """
         Transmits a RACE packet and synchronously waits for its matching response.
         Any asynchronous notifications (0x5D) received along the way are cached in pending_notifications.
         """
-        self.drain(max_rounds=3)
+        self.drain()
         self.write_race_packet(race_packet)
         if self.dry_run:
             return None
@@ -326,22 +379,21 @@ class Transport:
 
         raise TimeoutError(f"Timed out waiting for device response to command 0x{expected_cmd:04X} ({race_packet.hex(' ')})")
 
+    @_locked
     def query_notification(self, query_packet: bytes, timeout_sec: float = 2.0) -> Optional[bytes]:
         """
         Sends a query (e.g. Battery 0x0CD6, Firmware 0x1C07) and waits for its 0x5D notification.
+        Returns None on timeout, or straight away if the device's ACK reports an error status
+        (no notification follows one), instead of waiting out the whole timeout.
         """
-        self.drain(max_rounds=3)
+        # drain() also discards pending_notifications, which are all stale by now: an older
+        # notification for this command would report an old value as the current one.
+        self.drain()
         self.write_race_packet(query_packet)
         if self.dry_run:
             return None
 
         expected_cmd = struct.unpack_from("<H", query_packet, 4)[0]
-
-        # Check if already in pending notifications
-        for idx, p in enumerate(self.pending_notifications):
-            if len(p) >= 6 and p[1] == 0x5D and struct.unpack_from("<H", p, 4)[0] == expected_cmd:
-                return self.pending_notifications.pop(idx)
-
         deadline = time.time() + timeout_sec
         while time.time() < deadline:
             report = self.poll_input_report()
@@ -353,6 +405,8 @@ class Transport:
                         cmd = struct.unpack_from("<H", p, 4)[0]
                         if direction == 0x5D and cmd == expected_cmd:
                             return p
+                        elif direction == 0x5B and cmd == expected_cmd and len(p) >= 7 and p[6] != 0:
+                            return None
                         elif direction == 0x5D:
                             self.pending_notifications.append(p)
             time.sleep(0.02)
