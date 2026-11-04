@@ -24,7 +24,7 @@ try:
 except ImportError:
     CURSES_AVAILABLE = False
 
-from maxwell2.client import MaxwellClient
+from maxwell2.client import MaxwellClient, BATTERY_CHARGING, BATTERY_CHARGED
 from maxwell2.protocol import (
     PRESET_NAMES,
     build_write_control_command,
@@ -41,6 +41,9 @@ from maxwell2.backup import create_backup, list_backups
 
 STANDARD_FREQS = [32, 64, 125, 250, 500, 1000, 2000, 4000, 8000, 16000]
 
+# How often the dashboard re-reads battery and charging state in the background
+POWER_POLL_INTERVAL_SEC = 30.0
+
 CURVE_PROFILES: Dict[str, List[float]] = {
     "Flat (0 dB)": [0.0] * 10,
     "Harman Target": [4.0, 3.5, 2.0, 0.5, 0.0, 0.5, 1.5, 2.5, 1.0, 0.5],
@@ -52,7 +55,9 @@ CURVE_PROFILES: Dict[str, List[float]] = {
 
 DEFAULT_STATUS = {
     "preset": {"index": 4, "name": "Immersive", "is_custom": False, "slot": None},
-    "battery_percent": 94,
+    "battery_percent": None,
+    "usb_powered": False,
+    "battery_state": None,
     "firmware": {"firmware": "v1.0.5.7.4", "dongle": "v1.0.5.7.4", "headset": "v1.0.5.7.4", "match": True},
     "mic_muted": False,
     "sidetone": {"enabled": False, "level": 5, "max_level": 31},
@@ -112,8 +117,11 @@ class CursesTUI:
         self.stdscr = stdscr
         self.client = client
         self.running = True
-        # True while the background thread is using the transport, which isn't thread-safe
+        # True while a background thread reads full status: hardware actions wait for it
         self.loading = False
+        # Background battery/charging poll
+        self.power_poll_thread: Optional[threading.Thread] = None
+        self.last_power_poll = time.time()
 
         # Active view:
         # 0 = Controls & Presets
@@ -231,6 +239,40 @@ class CursesTUI:
             return f"{text} (unconfirmed: headset not responding)"
         return text
 
+    def maybe_poll_power(self):
+        """Starts a background battery/charging read every POWER_POLL_INTERVAL_SEC."""
+        if self.client is None or self.loading or not hasattr(self.client, "get_power"):
+            return
+        if self.power_poll_thread is not None and self.power_poll_thread.is_alive():
+            return
+        if time.time() - self.last_power_poll < POWER_POLL_INTERVAL_SEC:
+            return
+        self.last_power_poll = time.time()
+        self.power_poll_thread = threading.Thread(target=self.poll_power, daemon=True)
+        self.power_poll_thread.start()
+
+    def poll_power(self):
+        """
+        Re-reads battery level and charging state. One short attempt, so a key pressed meanwhile
+        waits at most about a second for the transport. If a silent headset starts answering
+        (switched on, or plugged in), the rest of the status is reloaded too.
+        """
+        try:
+            power = self.client.get_power(attempts=1, timeout_sec=1.0)
+        except Exception:
+            return
+        was_silent = self.status.get("device_responding") is False
+        self.status.update(power)
+        if was_silent and power.get("battery_percent") is not None:
+            self.loading = True
+            try:
+                self.status.update(self.client.get_status())
+                self.message = "Headset is answering again: status reloaded."
+            except Exception as e:
+                self.message = f"Refresh note: {e}"
+            finally:
+                self.loading = False
+
     def set_tab(self, tab_idx: int):
         """Switches active view tab cleanly."""
         self.active_tab = tab_idx % self.TOTAL_TABS
@@ -273,6 +315,7 @@ class CursesTUI:
             except Exception as e:
                 safe_addstr(self.stdscr, 1, 2, f"Render notice: {e}", self.C_WARN)
             self.stdscr.refresh()
+            self.maybe_poll_power()
 
             try:
                 ch = self.stdscr.getch()
@@ -327,13 +370,17 @@ class CursesTUI:
     def render_header(self, max_y: int, max_x: int):
         """Renders sleek top telemetry bar."""
         fw = self.status.get("firmware", {}).get("firmware", "v1.0.5.7.4")
-        batt = self.status.get("battery_percent", 94)
+        batt = self.status.get("battery_percent")
         mute = self.status.get("mic_muted", False)
 
-        # Battery block
-        pct = max(0, min(100, batt if batt is not None else 0))
-        filled = int(pct / 10)
-        batt_bar = f"[{'■' * filled}{'□' * (10 - filled)}] {pct}%"
+        # Battery block: an unknown level reads as "--", never as an empty 0% battery
+        if batt is None:
+            batt_bar = "[??????????] --%"
+        else:
+            pct = max(0, min(100, batt))
+            filled = int(pct / 10)
+            batt_bar = f"[{'■' * filled}{'□' * (10 - filled)}] {pct}%"
+        charge = {BATTERY_CHARGING: " CHARGING", BATTERY_CHARGED: " FULL"}.get(self.status.get("battery_state"), "")
         mic_tag = "MUTED" if mute else "LIVE"
 
         title_left = " AUDEZE FOR LINUX — STUDIO DASHBOARD "
@@ -346,7 +393,11 @@ class CursesTUI:
         elif not self.has_live_status():
             telemetry = "HEADSET NOT RESPONDING "
         else:
-            telemetry = f"FW: {fw}  •  Mic: {mic_tag}  •  Batt: {batt_bar} "
+            telemetry = f"FW: {fw}  •  Mic: {mic_tag}  •  Batt: {batt_bar}{charge} "
+            if len(title_left) + 4 + len(telemetry) + 2 > max_x:
+                # Narrow terminal: drop the firmware and the bar, battery first so it is never cut off
+                pct_text = f"{batt}%" if batt is not None else "--%"
+                telemetry = f"Batt: {pct_text}{charge}  •  Mic: {mic_tag} "
         telemetry_x = max(len(title_left) + 4, max_x - len(telemetry) - 2)
         safe_addstr(self.stdscr, 1, telemetry_x, telemetry, self.C_NORMAL)
         safe_addstr(self.stdscr, 1, max_x - 1, "│", self.C_DIM)
@@ -605,11 +656,17 @@ class CursesTUI:
         d_fw = self.status.get("firmware", {}).get("dongle", "v1.0.5.7.4")
         h_fw = self.status.get("firmware", {}).get("headset", "v1.0.5.7.4")
         parity = (d_fw == h_fw and d_fw != "Unknown")
-        batt = self.status.get("battery_percent", 94)
+        batt = self.status.get("battery_percent")
         batt_safe = (batt is not None and batt >= 50)
 
         p_str = "MATCHED (Synchronized)" if parity else "MISMATCH WARNING"
-        b_str = f"{batt}% (Pass >= 50%)" if batt_safe else f"{batt}% (LOW - Flashing Blocked)"
+        if batt is None:
+            b_str = "Unknown (Flashing Blocked)"
+        else:
+            b_str = f"{batt}% (Pass >= 50%)" if batt_safe else f"{batt}% (LOW - Flashing Blocked)"
+        charge = {BATTERY_CHARGING: ", charging", BATTERY_CHARGED: ", fully charged"}.get(self.status.get("battery_state"))
+        if charge:
+            b_str = b_str[:-1] + charge + ")"
 
         safe_addstr(self.stdscr, start_y + 1, 4, f"USB Dongle Firmware       : {d_fw:<24} [Operational]", self.C_NORMAL)
         safe_addstr(self.stdscr, start_y + 2, 4, f"Wireless Headset Firmware : {h_fw:<24} [Operational]", self.C_NORMAL)
@@ -1033,6 +1090,7 @@ class CursesTUI:
         try:
             live = self.client.get_status()
             self.status.update(live)
+            self.last_power_poll = time.time()
             self.system_backups = list_backups()
             if live.get("device_responding") is False:
                 self.message = self.no_response_message()

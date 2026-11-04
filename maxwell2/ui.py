@@ -36,10 +36,17 @@ def render_banner() -> str:
     )
 
 
-def render_battery_bar(percent: Optional[int], width: int = 18) -> str:
-    """Renders a sleek monochrome visual battery gauge."""
+def render_battery_bar(percent: Optional[int], width: int = 18, charge_state: Optional[str] = None) -> str:
+    """Renders a sleek monochrome visual battery gauge, with the charging state when known."""
+    if charge_state == "charging":
+        charge_tag = " [bold black on white] ⚡ CHARGING (USB-C) [/]"
+    elif charge_state == "charged":
+        charge_tag = " [bold black on white] ✔ FULLY CHARGED (USB-C) [/]"
+    else:
+        charge_tag = ""
+
     if percent is None:
-        return "[dim][ ?????????????????? ] Disconnected[/dim]"
+        return "[dim][ ?????????????????? ] Unknown (headset off or out of range)[/dim]" + charge_tag
 
     filled_len = int((percent / 100.0) * width)
     unfilled_len = width - filled_len
@@ -54,7 +61,7 @@ def render_battery_bar(percent: Optional[int], width: int = 18) -> str:
         bar = "[bold reverse white]" + "█" * filled_len + "[/]" + "[dim]░[/dim]" * unfilled_len
         state = "LOW"
 
-    return f"[bold white]{percent}%[/] [{bar}] [dim]({state})[/dim]"
+    return f"[bold white]{percent}%[/] [{bar}] [dim]({state})[/dim]{charge_tag}"
 
 
 def render_slider_bar(value: int, max_val: int = 20, width: int = 22, left_label: str = "Game", right_label: str = "Chat") -> str:
@@ -189,7 +196,7 @@ def print_rich_status(status: Dict[str, Any]):
 
     # Battery
     batt = status.get("battery_percent")
-    status_table.add_row("Battery Gauge", render_battery_bar(batt))
+    status_table.add_row("Battery Gauge", render_battery_bar(batt, charge_state=status.get("battery_state")))
 
     # Mic Mute
     mute = status.get("mic_muted")

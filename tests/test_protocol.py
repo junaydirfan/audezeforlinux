@@ -469,8 +469,10 @@ class FakeFotaTransport:
         self.fail_at = fail_at
         self.interrupt_at = interrupt_at
         self.writes = []  # (packet, is_dongle route flag)
+        self.reconnect_flags = []
 
-    def write_race_packet(self, race_packet, is_dongle=None):
+    def write_race_packet(self, race_packet, is_dongle=None, reconnect=True):
+        self.reconnect_flags.append(reconnect)
         if len(self.writes) == self.interrupt_at:
             raise KeyboardInterrupt
         if len(self.writes) == self.fail_at:
@@ -570,6 +572,8 @@ class TestFotaLiveHarness(unittest.TestCase):
         payload = b"".join(pkt[6:] for pkt, _ in t.writes)
         self.assertEqual(payload, bytes(engine.package.raw_data))
         self.assertTrue(all(pkt[:2] == b"\x15\x5a" for pkt, _ in t.writes))
+        # A device that drops off mid-flash must fail the transfer, not be silently reopened
+        self.assertEqual(set(t.reconnect_flags), {False})
 
     def test_fails_closed_on_unreadable_device_state(self):
         from maxwell2.firmware import FotaSafetyError

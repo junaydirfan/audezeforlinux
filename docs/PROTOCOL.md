@@ -95,8 +95,13 @@ Queries the headset's current battery percentage.
 - **Request Opcode**: `0x0CD6`
 - **Request Bytes**: `05 5A 03 00 D6 0C 00`
 - **Immediate Response (ACK)**: `05 5B 03 00 D6 0C 00`
-- **Asynchronous Notification**: `05 5D <len_lo> <len_hi> D6 0C <status> <level>`
+- **Asynchronous Notification**: `05 5D 05 00 D6 0C <status> <role> <level>`
+  - `status`: `0x00` = OK. `role`: `0x00` (only value seen).
   - `level`: Integer `0..100` representing battery percentage.
+- **Error ACK**: `05 5B 03 00 D6 0C 02`: no notification follows. Seen for a request byte of `0x01`, and over the dongle on route `0x00`.
+- **Charging state** [CONFIRMED on 3329:4B28 + 4B2E]: no RACE field or input report carries it (input reports `0x03`, `0x04` and `0x0A` read all zero while charging). The headset does enumerate as its own USB device (e.g. `4B2E`) only while a USB-C data cable powers it, so that node's presence means it is charging. It keeps answering status queries over USB even when switched off; the dongle gets no reply then.
+- **Re-enumeration**: switching the headset on or off makes both the headset and the dongle re-enumerate, often with swapped `/dev/hidrawN` numbers. An open file descriptor goes dead (`ENODEV` on write) and the device has to be reopened.
+- The level read just before and after a power cycle while charging can differ a lot (52% → 70% observed), so treat a single reading as approximate.
 
 #### Firmware Version Query [CONFIRMED]
 Queries the firmware version string.

@@ -826,7 +826,7 @@ class FotaEngine:
                 if not self.dry_run:
                     # Live hardware write via Report 0x06 (cbreak / FOTA block transmission)
                     fota_packet = bytes([0x15, 0x5A]) + struct.pack("<HH", len(chunk_data) + 2, 0x1C03) + chunk_data
-                    self.client.transport.write_race_packet(fota_packet, is_dongle=relay)
+                    self.client.transport.write_race_packet(fota_packet, is_dongle=relay, reconnect=False)
                 else:
                     # In dry_run/simulation: smooth progression
                     time.sleep(0.001)
