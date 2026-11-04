@@ -444,11 +444,19 @@ def parse_preset_index(packet: bytes) -> Dict[str, Any]:
 
 
 def parse_battery_notification(packet: bytes) -> int:
-    """Parses asynchronous battery notification (0x0CD6)."""
+    """
+    Parses asynchronous battery notification (0x0CD6): payload is <status> <role> <level>.
+    A non-zero status or a level above 100 is refused rather than shown as a percentage.
+    """
     cmd, payload = parse_race_packet(packet, expected_dir=DIRECTION_NOTIFICATION)
     if cmd != CMD_BATTERY or len(payload) < 3:
         raise ProtocolError("Invalid battery notification")
-    return payload[2]
+    status, level = payload[0], payload[2]
+    if status != 0:
+        raise ProtocolError(f"Device reported error status {status} for battery query")
+    if level > 100:
+        raise ProtocolError(f"Battery level out of range: {level}")
+    return level
 
 
 def parse_firmware_notification(packet: bytes) -> str:

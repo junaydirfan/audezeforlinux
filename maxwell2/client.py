@@ -37,10 +37,35 @@ from maxwell2.protocol import (
     PRESET_NAMES,
     ProtocolError,
 )
-from maxwell2.transport import Transport
+from maxwell2.transport import Transport, list_maxwell_devices
 from maxwell2.backup import create_backup, load_backup
 
 COEFFICIENT_READ_ATTEMPTS = 6
+BATTERY_READ_ATTEMPTS = 2
+
+BATTERY_CHARGING = "charging"
+BATTERY_CHARGED = "charged"
+
+
+def battery_state(percent: Optional[int], usb_powered: bool) -> Optional[str]:
+    """'charging' or 'charged' while the headset is on USB-C power, else None (state unknown)."""
+    if not usb_powered:
+        return None
+    return BATTERY_CHARGED if percent is not None and percent >= 100 else BATTERY_CHARGING
+
+
+def describe_battery(status: Dict[str, Any]) -> str:
+    """One-line battery summary for a status dict, e.g. '70% (charging over USB-C)'."""
+    percent = status.get("battery_percent")
+    state = status.get("battery_state")
+    text = f"{percent}%" if percent is not None else "Unknown"
+    if state == BATTERY_CHARGING:
+        text += " (charging over USB-C)"
+    elif state == BATTERY_CHARGED:
+        text += " (fully charged, on USB-C)"
+    elif percent is None:
+        text += " (headset off or out of range)"
+    return text
 
 
 class MaxwellClient:
@@ -63,18 +88,39 @@ class MaxwellClient:
             return {"index": 1, "name": "Audeze (Simulated)", "is_custom": False, "slot": None}
         return parse_preset_index(resp)
 
-    def get_battery(self) -> Optional[int]:
-        """Queries battery level percentage (0..100)."""
+    def get_battery(self, attempts: int = BATTERY_READ_ATTEMPTS, timeout_sec: float = 2.0) -> Optional[int]:
+        """Queries battery level percentage (0..100). Returns None if the headset doesn't answer."""
         if self.transport.dry_run:
             return 85
         packet = build_battery_command()
-        notif = self.transport.query_notification(packet, timeout_sec=2.0)
-        if notif:
-            try:
-                return parse_battery_notification(notif)
-            except Exception:
-                pass
+        for _ in range(attempts):
+            notif = self.transport.query_notification(packet, timeout_sec=timeout_sec)
+            if notif:
+                try:
+                    return parse_battery_notification(notif)
+                except ProtocolError:
+                    pass
         return None
+
+    def is_usb_powered(self) -> bool:
+        """
+        True when the headset is connected to this computer over USB-C, which also charges it.
+        The headset only shows up as its own USB device (not the dongle) on a data cable, so
+        charging from a wall adapter or a charge-only cable can't be detected.
+        """
+        if self.transport.dry_run:
+            return False
+        return any(not dev["is_dongle"] for dev in list_maxwell_devices())
+
+    def get_power(self, attempts: int = BATTERY_READ_ATTEMPTS, timeout_sec: float = 2.0) -> Dict[str, Any]:
+        """Battery level plus charging state, as stored under the same keys by get_status()."""
+        percent = self.get_battery(attempts=attempts, timeout_sec=timeout_sec)
+        usb_powered = self.is_usb_powered()
+        return {
+            "battery_percent": percent,
+            "usb_powered": usb_powered,
+            "battery_state": battery_state(percent, usb_powered),
+        }
 
     def get_firmware(self) -> Dict[str, Any]:
         """Queries both dongle and headset firmware versions."""
@@ -186,10 +232,11 @@ class MaxwellClient:
             status["preset"] = {"index": 4, "name": "Immersive", "is_custom": False, "slot": None}
 
         try:
-            status["battery_percent"] = self.get_battery()
+            status.update(self.get_power())
             responded = responded or status["battery_percent"] is not None
         except Exception:
-            status["battery_percent"] = 90
+            # Never a made-up level: an unknown battery reads as unknown
+            status.update({"battery_percent": None, "usb_powered": False, "battery_state": None})
 
         try:
             status["firmware"] = self.get_firmware()
