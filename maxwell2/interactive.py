@@ -231,7 +231,8 @@ class CursesTUI:
         return not self.loading and self.status.get("device_responding") is not False
 
     def no_response_message(self) -> str:
-        return "No response from headset: is it on and linked to the dongle? Press [r] to retry."
+        return ("No response: is the headset on and linked? If so, replug the dongle (it can get stuck). "
+                "[r] retry; 'audezeforlinux doctor' diagnoses it.")
 
     def sent_message(self, text: str) -> str:
         """Fast writes aren't acknowledged, so don't claim success to a silent headset."""
@@ -369,9 +370,10 @@ class CursesTUI:
 
     def render_header(self, max_y: int, max_x: int):
         """Renders sleek top telemetry bar."""
-        fw = self.status.get("firmware", {}).get("firmware", "v1.0.5.7.4")
+        unread = set(self.status.get("unreadable") or [])
+        fw = "--" if "firmware" in unread else self.status.get("firmware", {}).get("firmware", "--")
         batt = self.status.get("battery_percent")
-        mute = self.status.get("mic_muted", False)
+        mute = self.status.get("mic_muted")
 
         # Battery block: an unknown level reads as "--", never as an empty 0% battery
         if batt is None:
@@ -381,7 +383,7 @@ class CursesTUI:
             filled = int(pct / 10)
             batt_bar = f"[{'■' * filled}{'□' * (10 - filled)}] {pct}%"
         charge = {BATTERY_CHARGING: " CHARGING", BATTERY_CHARGED: " FULL"}.get(self.status.get("battery_state"), "")
-        mic_tag = "MUTED" if mute else "LIVE"
+        mic_tag = "MUTED" if mute is True else ("LIVE" if mute is False and "mic_muted" not in unread else "--")
 
         title_left = " AUDEZE FOR LINUX — STUDIO DASHBOARD "
         safe_addstr(self.stdscr, 0, 0, "┌" + "─" * (max_x - 2) + "┐", self.C_DIM)

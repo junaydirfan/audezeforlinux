@@ -77,25 +77,60 @@ class DeviceAbortError(ProtocolError):
     pass
 
 
-def list_maxwell_devices() -> List[dict]:
+PID_MODELS = {
+    0x4B28: "Maxwell 2 (Xbox Dongle)",
+    0x4B29: "Maxwell 2 (PlayStation / PC Dongle)",
+    0x4B2A: "Maxwell 2 (Direct USB)",
+    0x4B2E: "Maxwell 2 (Xbox Direct USB)",
+    0x4BA8: "Maxwell 2 ANC (Xbox Dongle)",
+    0x4BA9: "Maxwell 2 ANC (PlayStation Dongle)",
+    0x4B18: "Maxwell 1 (Xbox Dongle)",
+    0x4B19: "Maxwell 1 (PlayStation Dongle)",
+    0x4B1A: "Maxwell 1 (PlayStation USB)",
+    0x4B1E: "Maxwell 1 (Xbox USB)",
+}
+
+
+# Vendor collection that carries the control protocol (reports 0x06 / 0x07), on every Maxwell.
+# HeadsetControl selects it the same way (usage page 0xFF13, usage 1): interface 0 on the original
+# Maxwell, interface 5 on the Maxwell 2 dongle.
+CONTROL_USAGE_PAGE = 0xFF13
+
+
+def descriptor_usage_pages(descriptor: bytes) -> List[int]:
+    """Usage pages declared in a HID report descriptor (global Usage Page items), in order."""
+    pages = []
+    i = 0
+    while i < len(descriptor):
+        prefix = descriptor[i]
+        if prefix == 0xFE:  # long item: 0xFE, data size, tag, data
+            if i + 1 >= len(descriptor):
+                break
+            i += 3 + descriptor[i + 1]
+            continue
+        size = (0, 1, 2, 4)[prefix & 0x03]
+        if prefix & 0xFC == 0x04:  # global item, tag 0: Usage Page
+            pages.append(int.from_bytes(descriptor[i + 1:i + 1 + size], "little"))
+        i += 1 + size
+    return pages
+
+
+def _node_number(path: str) -> int:
+    digits = "".join(ch for ch in os.path.basename(path) if ch.isdigit())
+    return int(digits) if digits else 0
+
+
+def list_maxwell_devices(include_all: bool = False) -> List[dict]:
     """
     Scans sysfs to locate all connected Audeze Maxwell hidraw nodes.
-    Returns list of dicts: [{"path": "/dev/hidrawX", "pid": pid, "is_dongle": bool, "model": str}]
+    Returns list of dicts: [{"path": "/dev/hidrawX", "pid": pid, "is_dongle": bool, "model": str,
+    "interface": "1-3:1.0", "has_control": True/False/None}]
+    Nodes whose HID descriptor lacks the control collection (usage page 0xFF13) can't carry the
+    protocol and are left out unless include_all; nodes whose descriptor can't be read are kept.
+    Sorted by node number (hidraw2 before hidraw10).
     """
     found = []
-    pid_models = {
-        0x4B28: "Maxwell 2 (Xbox Dongle)",
-        0x4B29: "Maxwell 2 (PlayStation / PC Dongle)",
-        0x4B2A: "Maxwell 2 (Direct USB)",
-        0x4B2E: "Maxwell 2 (Xbox Direct USB)",
-        0x4BA8: "Maxwell 2 ANC (Xbox Dongle)",
-        0x4BA9: "Maxwell 2 ANC (PlayStation Dongle)",
-        0x4B18: "Maxwell 1 (Xbox Dongle)",
-        0x4B19: "Maxwell 1 (PlayStation Dongle)",
-        0x4B1A: "Maxwell 1 (PlayStation USB)",
-        0x4B1E: "Maxwell 1 (Xbox USB)",
-    }
-    for hidraw_dir in sorted(glob.glob("/sys/class/hidraw/hidraw*")):
+    for hidraw_dir in sorted(glob.glob("/sys/class/hidraw/hidraw*"), key=_node_number):
         uevent_path = os.path.join(hidraw_dir, "device", "uevent")
         if not os.path.exists(uevent_path):
             continue
@@ -112,12 +147,26 @@ def list_maxwell_devices() -> List[dict]:
                     node_name = os.path.basename(hidraw_dir)
                     dev_path = f"/dev/{node_name}"
                     is_dongle = pid in DONGLE_PIDS
-                    model = pid_models.get(pid, f"Audeze Device (PID 0x{pid:04X})")
+                    model = PID_MODELS.get(pid, f"Audeze Device (PID 0x{pid:04X})")
+                    has_control = None
+                    try:
+                        with open(os.path.join(hidraw_dir, "device", "report_descriptor"), "rb") as f:
+                            has_control = CONTROL_USAGE_PAGE in descriptor_usage_pages(f.read())
+                    except OSError:
+                        pass
+                    try:
+                        interface = os.path.basename(os.path.realpath(os.path.join(hidraw_dir, "device", "..")))
+                    except OSError:
+                        interface = ""
+                    if has_control is False and not include_all:
+                        continue  # e.g. a separate consumer-control interface: no replies ever come from it
                     found.append({
                         "path": dev_path,
                         "pid": pid,
                         "is_dongle": is_dongle,
                         "model": model,
+                        "interface": interface,
+                        "has_control": has_control,
                     })
         except Exception:
             continue

@@ -69,27 +69,53 @@ def run_doctor() -> Dict[str, Any]:
 
     # 4. Device detection & permissions
     from maxwell2.transport import list_maxwell_devices
+    from maxwell2.diagnose import container_environment, diagnose
+    container = container_environment()
     devices = list_maxwell_devices()
     has_device = len(devices) > 0
 
-    perm_ok = False
-    accessible_node = None
-    if has_device:
-        node = devices[0]["path"]
-        accessible_node = node
-        perm_ok = os.access(node, os.R_OK | os.W_OK)
+    denied = [d["path"] for d in devices if not os.access(d["path"], os.R_OK | os.W_OK)]
+    perm_ok = has_device and not denied
 
     results["hardware_device"] = {
         "status": has_device,
-        "detail": f"{len(devices)} Audeze device(s) detected: {[d['path'] for d in devices]}" if has_device else "No Audeze Maxwell USB device found",
+        "detail": (f"{len(devices)} found: " + ", ".join(f"{d['path']} {d['model']}" for d in devices))
+        if has_device else "No Audeze Maxwell USB device found",
         "advice": "Connect your Audeze USB dongle or headset" if not has_device else "Connected",
     }
 
+    if not has_device:
+        perm_advice = "Connect the device first"
+    elif denied and container:
+        perm_advice = (f"Running inside {container}: install the udev rule on the HOST, not in the container "
+                       "(copy udev/70-audeze-maxwell.rules to the host's /etc/udev/rules.d/, reload udev, replug)")
+    elif denied:
+        perm_advice = "Run './audezeforlinux setup-udev' to grant user permissions, then replug the device"
+    else:
+        perm_advice = "Ready without sudo"
     results["permissions"] = {
         "status": perm_ok,
-        "detail": f"Read/Write access on {accessible_node}: {'PASS' if perm_ok else 'DENIED'}",
-        "advice": "Run './audezeforlinux setup-udev' to grant user permissions" if not perm_ok else "Ready without sudo",
+        "detail": ("Read/write access: " + ("PASS" if perm_ok else "DENIED on " + ", ".join(denied)))
+        if has_device else "No device to check",
+        "advice": perm_advice,
     }
+
+    results["environment"] = {
+        "status": True,  # informational: a container is fine once the host has the udev rule
+        "detail": f"Inside {container}" if container else "Host system",
+        "advice": "udev rules must be installed on the host" if container else "",
+    }
+
+    # 4b. Live, read-only probe: does the dongle answer, and does the headset answer through it?
+    if has_device:
+        live = diagnose()
+        first_issue = next((n for n in live["nodes"] if n["verdict"] != "ok"), None)
+        results["connection"] = {
+            "status": live["ok"],
+            "detail": "; ".join(f"{n['path']}: {n['verdict']}" for n in live["nodes"]) or "no control interface found",
+            "advice": " ".join(first_issue["advice"]) if first_issue and not live["ok"] else "",
+            "nodes": live["nodes"],
+        }
 
     # 5. Audio server (PipeWire / WirePlumber)
     audio_server = "Linux Audio"
@@ -123,13 +149,35 @@ def format_doctor_report(diag: Dict[str, Any]) -> str:
         ("Hardware Detection", diag.get("hardware_device", {})),
         ("Udev Permissions", diag.get("permissions", {})),
         ("Udev Configuration", diag.get("udev_rule", {})),
+        ("Environment", diag.get("environment", {})),
+        ("Headset Connection", diag.get("connection", {})),
         ("Audio Server", diag.get("audio_server", {})),
     ]
+    items = [(title, info) for title, info in items if info]
 
     for title, info in items:
         status_sym = "✔ PASS" if info.get("status") else "✖ FAIL"
         detail = info.get("detail", "")
-        lines.append(f"│  {title:<22} : [{status_sym:<6}] {detail:<33} │")
+        lines.append(f"│  {title:<22} : [{status_sym:<6}] {detail}")
+
+    nodes = diag.get("connection", {}).get("nodes") or []
+    if nodes:
+        lines.append("│                                                                      │")
+        lines.append("├─ LIVE CONNECTION PROBE (read-only queries) ──────────────────────────┤")
+        for n in nodes:
+            lines.append(f"│  {n['path']}  {n.get('model')}  [USB interface {n.get('interface') or '?'}]")
+            labels = {
+                "node_firmware": "dongle itself" if "Dongle" in (n.get("model") or "") else "headset (USB)",
+                "headset_preset": "headset preset",
+                "headset_battery": "headset battery",
+            }
+            for name, q in (n.get("queries") or {}).items():
+                got = "answered" if (q.get("result") or q.get("ack")) else ("error: " + q["error"] if q.get("error") else "no reply")
+                lines.append(f"│     {labels.get(name, name):<16} {got:<10} ({q.get('packets', 0)} packets received)")
+            if n.get("holders"):
+                lines.append(f"│     also open in : {', '.join(n['holders'])}")
+            for advice in n.get("advice") or []:
+                lines.append(f"│     → {advice}")
 
     lines.append("│                                                                      │")
     lines.append("├─ RECOMMENDED ACTIONS ────────────────────────────────────────────────┤")
