@@ -44,6 +44,9 @@ SUB_AUTO_OFF = 0x01
 SUB_VOICE_PROMPT = 0x20
 SUB_MIC_MUTE = 0x22
 SUB_NOISE_REDUCTION = 0x24
+# 0x28..0x2A were decoded for the original Maxwell. On the Maxwell 2 over USB-C all three
+# read a fixed 0x80 and gain writes are refused (issue #9, docs/PROTOCOL.md 3.2), so
+# nothing here uses them.
 SUB_AMP_GAIN = 0x28
 SUB_LEFT_GAIN = 0x29
 SUB_RIGHT_GAIN = 0x2A

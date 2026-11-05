@@ -122,10 +122,10 @@ audezeforlinux dashboard
 | **Maxwell 2 ANC (Xbox Dongle)** | `3329:4BA8` | Wireless 2.4 GHz Dongle | Detected (ID from [#3](https://github.com/junaydirfan/audezeforlinux/issues/3)); controls untested |
 | **Maxwell 2 ANC (PlayStation Dongle)** | `3329:4BA9` | Wireless 2.4 GHz Dongle | Detected (ID from [#4](https://github.com/junaydirfan/audezeforlinux/issues/4); ANC inferred from the ID, not yet confirmed); controls untested |
 | **Maxwell 2 ANC (Direct USB-C)** | Unknown | — | Device IDs needed ([open an issue](https://github.com/junaydirfan/audezeforlinux/issues) with your `lsusb` output) |
-| **Maxwell 1 (Xbox Dongle)** | `3329:4B18` | Wireless 2.4 GHz Dongle | Expected to work: same protocol as the Maxwell 2 (HeadsetControl supports it); **not yet confirmed here, please report** |
-| **Maxwell 1 (PlayStation Dongle)** | `3329:4B19` | Wireless 2.4 GHz Dongle | Expected to work, as above; please report |
-| **Maxwell 1 (PlayStation USB-C)** | `3329:4B1A` | Direct USB Audio / HID | Expected to work, as above; please report |
-| **Maxwell 1 (Xbox USB-C)** | `3329:4B1E` | Direct USB Audio / HID | Expected to work, as above; please report |
+| **Maxwell 1 (Xbox Dongle)** | `3329:4B18` | Wireless 2.4 GHz Dongle | **Confirmed by a user** (`status` and dashboard). If it reads nothing, replug the dongle (see [Troubleshooting](#troubleshooting)) |
+| **Maxwell 1 (PlayStation Dongle)** | `3329:4B19` | Wireless 2.4 GHz Dongle | Expected to work: same protocol as the Maxwell 1 Xbox dongle; please report |
+| **Maxwell 1 (PlayStation USB-C)** | `3329:4B1A` | Direct USB Audio / HID | Expected to work: same protocol; please report |
+| **Maxwell 1 (Xbox USB-C)** | `3329:4B1E` | Direct USB Audio / HID | Expected to work: same protocol; please report |
 
 Firmware updates are verified only on the Maxwell 2 (Xbox) and need `--experimental`; Maxwell 1 packages are refused.
 
