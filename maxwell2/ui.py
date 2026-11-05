@@ -175,13 +175,19 @@ def print_rich_status(status: Dict[str, Any]):
     console.print(Align.center(banner_text))
     console.print()
 
+    # Fields that didn't answer hold placeholders: show them as unknown, never as readings
+    unread = set(status.get("unreadable") or [])
+    no_reply = "[dim]Unknown (no reply)[/dim]"
+
     # Active preset badge (Clean inverted high-contrast pill)
     preset = status.get("preset", {})
     p_name = preset.get("name", "Unknown")
     p_idx = preset.get("index", 1)
     is_custom = preset.get("is_custom", False)
 
-    if is_custom:
+    if "preset" in unread:
+        preset_badge = "[bold black on white]  ● ACTIVE PRESET: UNKNOWN (NO REPLY)  [/]"
+    elif is_custom:
         slot_num = preset.get("slot", 0) + 1
         preset_badge = f"[bold black on white]  ● ACTIVE PRESET: [{p_idx}] {p_name.upper()} (CUSTOM SLOT {slot_num})  [/]"
     else:
@@ -210,21 +216,24 @@ def print_rich_status(status: Dict[str, Any]):
 
     # Sidetone
     st = status.get("sidetone", {})
-    st_str = render_sidetone_bar(st.get("level", 0), st.get("max_level", 31), st.get("enabled", False))
+    st_str = no_reply if "sidetone" in unread else \
+        render_sidetone_bar(st.get("level", 0), st.get("max_level", 31), st.get("enabled", False))
     status_table.add_row("Sidetone Monitor", st_str)
 
     # Game / Chat Mix
     cm = status.get("chat_mix", {})
-    cm_str = render_slider_bar(cm.get("raw", 10), max_val=20)
+    cm_str = no_reply if "chat_mix" in unread else render_slider_bar(cm.get("raw", 10), max_val=20)
     status_table.add_row("Game / Chat Balance", cm_str)
 
     # Noise Reduction
     nr = status.get("noise_reduction", {}).get("name", "Unknown")
-    status_table.add_row("AI Noise Reduction", f"[bold white]{nr}[/]")
+    status_table.add_row("AI Noise Reduction", no_reply if "noise_reduction" in unread else f"[bold white]{nr}[/]")
 
     # Firmware & Dongle Info
     fw = status.get("firmware", {}).get("firmware", "Unknown")
-    status_table.add_row("Hardware Info", f"[white]Audeze Maxwell 2 (Xbox Dongle)[/] • Firmware: [bold white]{fw}[/]")
+    fw_str = "Unknown (no reply)" if "firmware" in unread else fw
+    model = status.get("model", "Audeze Maxwell")
+    status_table.add_row("Hardware Info", f"[white]{model}[/] • Firmware: [bold white]{fw_str}[/]")
 
     console.print(Panel(status_table, title="[bold white]HARDWARE TELEMETRY & CONTROLS[/bold white]", border_style="white", box=box.ROUNDED))
     console.print()
