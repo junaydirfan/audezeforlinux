@@ -31,38 +31,46 @@ except ImportError:
 
 def format_plain_status(status: dict) -> str:
     lines = []
+    # Fields that didn't answer hold placeholders: show them as unknown, never as readings
+    unread = set(status.get("unreadable") or [])
+    unknown = "Unknown (no reply)"
     lines.append("=" * 60)
-    lines.append("  AUDEZE MAXWELL 2 - DEVICE STATUS")
+    lines.append(f"  AUDEZE {status.get('model', 'MAXWELL').upper()} - DEVICE STATUS")
     lines.append("=" * 60)
 
     preset = status.get("preset", {})
-    p_name = preset.get("name", "Unknown")
-    p_idx = preset.get("index", "?")
-    p_custom = " (Custom Slot " + str(preset.get("slot") + 1) + ")" if preset.get("is_custom") else ""
-    lines.append(f"  Active Preset      : [{p_idx}] {p_name}{p_custom}")
+    if "preset" in unread:
+        lines.append(f"  Active Preset      : {unknown}")
+    else:
+        p_name = preset.get("name", "Unknown")
+        p_idx = preset.get("index", "?")
+        p_custom = " (Custom Slot " + str(preset.get("slot") + 1) + ")" if preset.get("is_custom") else ""
+        lines.append(f"  Active Preset      : [{p_idx}] {p_name}{p_custom}")
 
     lines.append(f"  Battery Level      : {describe_battery(status)}")
 
     fw = status.get("firmware", {}).get("firmware", "Unknown")
-    lines.append(f"  Firmware Version   : {fw}")
+    lines.append(f"  Firmware Version   : {unknown if 'firmware' in unread else fw}")
 
     mute = status.get("mic_muted")
-    mute_str = "MUTED" if mute is True else ("UNMUTED" if mute is False else "Unknown")
-    lines.append(f"  Hardware Mic Switch: {mute_str}")
+    mute_str = "MUTED" if mute is True else ("UNMUTED" if mute is False else unknown)
+    lines.append(f"  Hardware Mic Switch: {unknown if 'mic_muted' in unread else mute_str}")
 
     st = status.get("sidetone", {})
-    st_state = "ON" if st.get("enabled") else "OFF"
-    st_lvl = st.get("level", 0)
-    st_max = st.get("max_level", 31)
-    lines.append(f"  Sidetone           : {st_state} (Level {st_lvl}/{st_max})")
+    if "sidetone" in unread:
+        lines.append(f"  Sidetone           : {unknown}")
+    else:
+        st_state = "ON" if st.get("enabled") else "OFF"
+        lines.append(f"  Sidetone           : {st_state} (Level {st.get('level', 0)}/{st.get('max_level', 31)})")
 
     cm = status.get("chat_mix", {})
-    game_pct = cm.get("game_pct", 50)
-    chat_pct = cm.get("chat_pct", 50)
-    lines.append(f"  Game / Chat Mix    : Game {game_pct}% | Chat {chat_pct}%")
+    if "chat_mix" in unread:
+        lines.append(f"  Game / Chat Mix    : {unknown}")
+    else:
+        lines.append(f"  Game / Chat Mix    : Game {cm.get('game_pct', 50)}% | Chat {cm.get('chat_pct', 50)}%")
 
     nr = status.get("noise_reduction", {}).get("name", "Unknown")
-    lines.append(f"  AI Noise Reduction : {nr}")
+    lines.append(f"  AI Noise Reduction : {unknown if 'noise_reduction' in unread else nr}")
     lines.append("=" * 60)
     return "\n".join(lines)
 
@@ -409,8 +417,13 @@ def main():
             if args.command == "status":
                 status = client.get_status()
                 if not status["device_responding"]:
-                    print("[!] No response from the headset: the values below are defaults, not readings.\n"
-                          "    Check that it is powered on and linked to the dongle.", file=sys.stderr)
+                    print("[!] No response from the headset: nothing below is a reading.\n"
+                          "    Check that it is powered on and linked to the dongle. If it is, unplug the dongle,\n"
+                          "    wait 5 seconds and plug it back in: Maxwell dongles can get stuck answering\n"
+                          "    nothing until they're replugged. Run 'audezeforlinux doctor' for a full check.",
+                          file=sys.stderr)
+                elif status.get("unreadable"):
+                    print(f"[!] No reply for: {', '.join(status['unreadable'])} (shown as Unknown).", file=sys.stderr)
                 if args.json:
                     print(json.dumps(status, indent=2))
                 elif RICH_AVAILABLE and not args.plain and sys.stdout.isatty():
