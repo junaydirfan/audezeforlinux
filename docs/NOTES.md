@@ -59,7 +59,7 @@
   - Sidetone: `OFF (Level 5/31)`
   - Game/Chat Balance: `50% Game / 50% Chat`
   - AI Noise Reduction: `Low`
-  - Volume Limiter: `Enabled (85 dB)`
+  - Volume Limiter: `Enabled (85 dB)` (not trustworthy: over USB-C the Maxwell 2 answers `0x28` with a fixed `0x80`, see `PROTOCOL.md` 3.2 and issue #9)
   - Custom EQ Slots 1..4: All 10 bands successfully read from NVDM keys `0xEF00..0xEF03`.
 
 ### Interactive TUI & Project Renaming Update

@@ -3,7 +3,7 @@
 This document details the communication protocol between host software and the Audeze Maxwell 2 headset/dongle over USB HID.
 
 > [!NOTE]
-> Every command and structure is explicitly marked as either **CONFIRMED** (verified through physical hardware report descriptors, live hardware tests, or byte-for-byte protocol captures) or **HYPOTHESIS** (derived from static binary disassembly of Audeze HQ 1.2.48 or inferred from Maxwell 1 behavior).
+> Every command and structure is explicitly marked as either **CONFIRMED** (verified through physical hardware report descriptors, live hardware tests, or byte-for-byte protocol captures) or **HYPOTHESIS** (derived from static binary disassembly of Audeze HQ 1.2.48 or inferred from Maxwell 1 behavior). A **CONFIRMED** label without a model applies to the Maxwell 2. Where a command was only checked on one model or connection, the label says so (for example "CONFIRMED on 3329:4B28"). **NOT IMPLEMENTED** means the firmware acknowledges the command but ignores it.
 
 ---
 
@@ -126,7 +126,7 @@ Controls are accessed via two command families:
 - **Read Request**: `05 5A 04 00 01 09 <sub> 00`
 - **Read Reply**: `05 5B 06 00 01 09 <sub> 00 <flags> <value>`
 - **Write Request**: `05 5A 05 00 00 09 <sub> 00 <value>`
-- **Write Reply**: `05 5B 05 00 00 09 <status> 00 <value>`
+- **Write Reply**: `05 5B 05 00 00 09 <sub> 00 <status>`: `0x00` = accepted. A non-zero status means the write was refused, and a read-back still shows the old value. Seen: `0x01` for sub `0x29` on 3329:4B2E ([#9](https://github.com/junaydirfan/audezeforlinux/issues/9)). Earlier versions of this document put the status first and the value last. The preset-select reply (section 3.1) and #9 both show the layout above.
 
 | Subcommand | Function | Type | Range / Values | Status |
 |:---:|:---|:---:|:---|:---:|
@@ -134,11 +134,22 @@ Controls are accessed via two command families:
 | `0x20` | Voice Prompt Level | R/W | `0..MAX` | CONFIRMED |
 | `0x22` | Microphone Physical Mute | Read-only | `0x00` = Muted, `0xFF` = Unmuted | CONFIRMED |
 | `0x24` | AI Noise Suppression | R/W | `0` = Off, `1` = Low, `2` = High | CONFIRMED |
-| `0x28` | Volume Limiter | R/W | `136` = Limiter ON, `142` = Limiter OFF | CONFIRMED |
+| `0x28` | Amp Gain / Volume Limiter | R/W | Writes: `136` = Limiter ON, `142` = Limiter OFF. Reads: a gain level; Audeze HQ treats `<= 136` as limiter ON | HYPOTHESIS (Audeze HQ, original Maxwell). Maxwell 2: see below |
 | `0x2C` | Sidetone Level | R/W | `0..MAX` | CONFIRMED |
 | `0x2D` | Max Sidetone Query | Read-only | Hardware max level (e.g. 31 or 100) | CONFIRMED |
-| `0x29` | Left Channel Gain | R/W | `0..150` (Safety cap, excludes 136/142) | CONFIRMED |
-| `0x2A` | Right Channel Gain | R/W | `0..150` (Safety cap, excludes 136/142) | CONFIRMED |
+| `0x29` | Left Channel Gain | R/W | `0..150` (Safety cap, excludes 136/142) | HYPOTHESIS (original Maxwell firmware research). NOT IMPLEMENTED on 3329:4B2E |
+| `0x2A` | Right Channel Gain | R/W | `0..150` (Safety cap, excludes 136/142) | HYPOTHESIS (original Maxwell firmware research). NOT IMPLEMENTED on 3329:4B2E |
+
+**Limiter and channel gains on the Maxwell 2** [OBSERVED on 3329:4B2E, firmware v1.0.5.7.4, [#9](https://github.com/junaydirfan/audezeforlinux/issues/9)]. Earlier versions of this document marked `0x28`, `0x29` and `0x2A` CONFIRMED. No Maxwell 2 test backed that label. The channel gains come from kats1123's firmware research on the original Maxwell. The limiter codes were decoded from Audeze HQ's original-Maxwell code path. Over USB-C, the Maxwell 2 answers:
+
+```
+read 0x28   05 5B 06 00 01 09 28 00 00 80
+read 0x29   05 5B 06 00 01 09 29 00 00 80
+read 0x2A   05 5B 06 00 01 09 2A 00 00 80
+write 0x29  05 5B 05 00 00 09 29 00 01      (status 0x01: refused)
+```
+
+All three reads stay at `0x80` (128) after a factory reset and after a preset change. A gain write is refused, the read-back stays at `0x80`, and nothing changes audibly. So `0x29` and `0x2A` aren't implemented there. `0x80` is the same placeholder in all three replies, so it shouldn't be read as "limiter ON" (`<= 136`) either. A `0x28` write and the dongle route (3329:4B28) are still untested. audezeforlinux doesn't read or write any of these three.
 
 #### Pair Controls Group (0x2C83 / 0x2C82)
 - **Read Request**: `05 5A 04 00 83 2C <sub> 00`
