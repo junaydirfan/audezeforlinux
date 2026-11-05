@@ -159,25 +159,125 @@ Changes:
 - Note: the user's Maxwell 2 Xbox dongle (3329:4B28) was connected while testing. One `--confirm-risk`
   CLI run opened it but was refused at the first live check, before any read or write.
 
+## Real update protocol (2026-11-03, branch feat/battery-charging-status, uncommitted)
+
+The old engine was wrong at the root: `0x1C03` is Airoha's FOTA *stop* command, and there was no
+start, erase, ACK handling or commit. Replaced with the flow race-toolkit implements
+(github.com/auracast-research/race-toolkit, `librace/`). Details are in `docs/FIRMWARE.md` §3.
+
+- Confirmed read-only on the user's Maxwell 2 (Xbox dongle 4B28 + headset 4B2E over USB-C, both
+  v1.0.5.7.4). The staging partition query (`0x1C00`) answers on the headset (`0x004BC000`+`0x323000`) and
+  the dongle (`0x00263000`+`0x194000`), and is also relayed to the headset on route 0x80. Page read `0x0403`
+  works (about 8 ms per page), and the headset's staging area reads all 0xFF. SDK `IoT_SDK_for_BT_Audio_V5.4.0.AB158x`.
+- Update model: the package is staged unchanged, and the bootloader installs it only after commit.
+  Not dual-bank. The headset staging area doesn't overlap any v1.0.5.7.4 package partition.
+- New `maxwell2/fota.py` (commands, page CRC-8, strict reply parsing). `FotaEngine` was rewritten: it erases
+  exactly the reported staging area, writes with retries, reads back every page, then runs the integrity
+  check and commits. Also added: `stage_only`, the `experimental` gate (`FOTA_EXPERIMENTAL_CHIPS`), an
+  exclusive flock on the device, auto-reconnect off during the run, and a settings backup first.
+- CLI: `--experimental`, `--stage-only`, `--pages-per-write`, phase-aware progress.
+- Tests: `tests/test_fota.py` (simulated node with a staging area and fault injection) replaces the
+  old `TestFotaLiveHarness`. Deliberately breaking the engine in 11 different ways (erase field order,
+  checksum, reconnect, read-back, commit handling, stage-only, overlap check, busy lock, 0x15 heads...)
+  makes the suite fail every time. 89 tests pass.
+- Biggest remaining risk is the erase payload order (`<BII` type, **length, address**). If it were swapped,
+  the device would get the address as a length. That layout comes from race-toolkit, and preflight
+  checks that the region is the device-reported staging area, but it hasn't run on a Maxwell 2 yet.
+- Unknown: whether a session left open after `--stage-only` (no commit, no `0x1C03` stop) changes
+  anything on the next boot. Check after the first stage-only run: power cycle, then
+  `firmware status` and a settings read.
+
+### First live stage-only run (2026-11-04, headset over USB-C, /dev/hidraw10)
+- Run 1: start, erase, all 9,147 page writes and the full read-back succeeded (every page identical),
+  then the integrity check timed out at 60 s. Repro (read-only read-back, then the integrity check)
+  showed why: the headset sent a FOTA stop `15 5a 05 00 03 1c 00 80 04` instead of replying. It ends an
+  idle session, and the ~70 s of page reads don't count as activity. With a fresh session start, the same
+  integrity check answered in 0.2 s (`15 5b 03 00 01 1c 00`, then indication `15 5d .. 01 1c 00 01 00 00`).
+- Fix: `FotaEngine._open_session()` again after the read-back. `Transport.exchange(abort_cmds=...)`
+  raises `DeviceAbortError` on a device-sent stop, so a run fails at once instead of timing out. The
+  page retry loops don't retry it. FakeNode in the tests models the session timeout.
+- Run 2: **success**, 193 s. Afterwards the headset reports v1.0.5.7.4, and its settings read normally.
+- Power cycle afterwards (user switched the headset off and on, still on USB-C): it booted normally and
+  re-enumerated (headset now hidraw1, dongle hidraw10). Still v1.0.5.7.4, settings unchanged, and the
+  staged copy is still in the staging area, untouched. So an uncommitted staged package is ignored
+  at boot. Answers the open question above.
+
+### Preparing the full update (2026-11-04)
+- Rehearsed the post-commit version check live by unplugging USB-C (read-only). Found a bug:
+  `MaxwellClient.get_firmware()` saved `transport.is_dongle`, set it to 0x00, then restored it. A reconnect
+  in between (USB node gone, now via the dongle) got its new route undone, so the "headset" query went
+  to the dongle and reported the dongle's version. Fixed with per-request `is_dongle` overrides
+  (`query_notification(..., is_dongle=)`), re-verified live: after the unplug, the transport is on the dongle,
+  relay route, headset version correct.
+- FotaEngine pins the node (path, PID, route) at preflight and refuses if it changes (second preflight
+  in execute(), or `_target_route`). Reconnect is disabled inside `_target_route`, preflight's partition
+  query included.
+- Battery measured off the charger: 85% (charging) settled to 62% within ~60 s of unplugging, then back to
+  85% within ~55 s of replugging. The value moves ~1 point / 2 s. New rule: settled reading (two reads 3 s
+  apart agree, 2 min limit), 50% off USB power, 90% on USB power or unknown (`required_battery_pct`,
+  `headset_usb_powered`). `firmware status` shows the same rule.
+- Same-version update: a version match now also needs the device seen rebooting (failed or Unknown read,
+  `Transport.reconnect_count` change, or a lost commit reply), else `no_reboot_seen`. The install wait is
+  now 600 s, with "Installing" progress in the CLI.
+- Package partitions (Xbox v1.0.5.7.4 headset): 0x15000 (DSP code), 0x1A5000 (MCU app), 0x451000 (128 KB),
+  0x471000 (300 KB, voice prompts incl. PAIRING.mp3 / DONGLEPAIRING.mp3, key table template), 0x7E0000
+  (8 KB). Nothing below 0x15000 (bootloader / partition table) or above 0x7E2000, where the live
+  NVDM (settings, pairing) most likely lives. So pairing probably survives, but that's unproven. `firmware
+  unpack` no longer applies AB1568 role names to these.
+
+### First full update (2026-11-04 20:17–20:21, headset over USB-C at 90% charging, same version)
+- Erase, write and read-back all OK, then session restart, integrity check, state 0x0211 and commit. The
+  headset rebooted ~3 s after the commit, and both /dev/hidraw1 and /dev/hidraw10 were recreated at
+  20:21:36–37 (the dongle reset too).
+- **Installed**: the staging area read all 0xFF afterwards (after stage-only plus a power cycle it had kept the
+  staged copy), so the bootloader consumed it. Headset v1.0.5.7.4, and the dongle relay works (pairing kept).
+- **Custom EQ slots reset to flat** (slot 1 +12/-12/+8/-6.5/+6.5 and slot 4 +6/+6/+6 became 0 dB). Preset,
+  sidetone, chat mix, NR and mic were kept. The pre-update backup (`backup_pre_firmware_update_20261104_201741.json`)
+  has the old curves. There's no restore command yet. Todo: offer to rewrite custom EQ from the backup after an update.
+- **Bug, fixed**: the CLI never confirmed. It stayed "rebooting / installing" for 280 s until stopped by hand.
+  The first reconnect hit the window where neither device existed, so it raised, `get_firmware()` swallowed
+  that, and the transport stayed closed. Every later write raised "Transport is not open." Now
+  `write_race_packet` retries the reconnect when an earlier one left it closed (`reconnect_count > 0`,
+  auto-reconnect on). Covered by `test_reconnect_retried_after_finding_no_device`. Live: a headset
+  power cycle (re-enumerates both devices twice) never got stuck, but every reconnect found at least one
+  device, so the exact empty window wasn't hit.
+
+### Follow-ups done the same evening
+- Custom EQ slots 1 and 4 restored from the pre-update backup (`write_custom_eq(..., activate=False)`); they
+  read back identical and the preset stayed Immersive. The engine now does this itself after a confirmed
+  install (`_restore_custom_eq`, result `eq_restored` / `eq_restore_errors`).
+- Dongle: stage-only (105 s) OK, then the full same-version update (110 s) OK. Staging blank afterwards,
+  v1.0.5.7.4, headset reachable through it, headset EQ intact. The dongle answered with its version ~4 s
+  after the commit and then dropped off USB again ~30 s later, so "answers with the right version" can
+  come before the install. Verification now requires the first staging page to be cleared
+  (`_staging_consumed`, status `still_staged`). Checked live, read-only, on all three routes.
+- Reconnect now prefers the same kind of node (`Transport.node_is_dongle`, `reconnect(prefer_dongle=)`), and a
+  dongle version only counts from a dongle node. Otherwise, after a dongle update with the headset on USB-C, the
+  headset's own version (route 0x00 on its node) would have confirmed the dongle install.
+- Not yet run: a headset update relayed through the dongle (wireless), and a real version change (only
+  same-version updates so far).
+- The battery gauge jumped from 34% to 72% within 2 minutes of plugging in USB-C, so the 50% gate passed
+  on a reading that probably overstated the charge. Fine for stage-only; worth thinking about before
+  committing (e.g. require some minutes on charge, or a higher threshold while charging).
+
 ## Plan / status
 
 - [ ] **Merge the version-tuple PR** (recommended; not done yet as of these notes).
 - [ ] Review and commit the local changes above.
-- [ ] **Reply to the issue** with the text below and leave it open.
-- [ ] Wait for the contributor's USB captures of the official Windows app updating a Maxwell 2.
-- [ ] When the captures arrive, compare the official packet layout (commands, chunk size,
-      start/erase/commit steps, routing) against `FotaEngine.execute()`.
-- [ ] Only after the framing is confirmed: accept or write a PR mapping
-      dongle → `AB1565_ULL2_DONGLE`, headset → `AB1585_Headset`.
-- [ ] Meanwhile (optional): make preflight *recognise* Maxwell 2 chip ids and give a clear
-      "Maxwell 2 flashing not yet supported" error instead of a generic "Target mismatch".
-- [ ] Update `docs/FIRMWARE.md` to cover the Maxwell 2 chips.
+- [ ] **Reply to the issue** with the text below and leave it open. (Now out of date: the protocol
+      came from race-toolkit, not captures. Captures of the official app would still be a useful cross-check.)
+- [x] Compare the update packet layout against a working implementation (race-toolkit, 2026-11-03).
+- [ ] Live `--stage-only` run on the headset over USB-C with the same-version package (needs the
+      user's go-ahead), then a full same-version update, then the dongle.
+- [ ] Only after a full update works: mark `AB1565_ULL2_DONGLE` / `AB1585_Headset` verified in `KNOWN_CHIP_IDS`.
+- [x] Preflight recognises the Maxwell 2 chip ids with a clear "not supported yet" error.
+- [x] Update `docs/FIRMWARE.md` to cover the Maxwell 2 chips and the real update flow.
 - [x] ANC catalog track + regular-vs-ANC firmware-track check (done 2026-10-26, see below).
 - [x] Corrected the fixed-layout claims in `docs/FIRMWARE.md`.
 - [ ] ANC: get `lsusb` output from an ANC owner (product IDs unknown), and find the current
       (non-rollback) ANC release so the ANC catalog can be marked complete.
-- [ ] Add the regular Maxwell 2 package hashes to `KNOWN_PACKAGE_TRACKS` (only the two PS ANC
-      hashes are in it so far).
+- [ ] Add the regular Maxwell 2 package hashes to `KNOWN_PACKAGE_TRACKS` (Xbox v1.0.5.7.4 dongle and
+      headset added 2026-11-03; PS and rollback still missing).
 
 ## ANC track work (2026-10-26)
 
