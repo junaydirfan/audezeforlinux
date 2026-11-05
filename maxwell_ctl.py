@@ -154,10 +154,25 @@ def main():
     fw_inspect.add_argument("file", help="Path to firmware .bin file to inspect")
     fw_unpack = fw_sub.add_parser("unpack", help="Decompress and extract firmware partitions to directory")
     fw_unpack.add_argument("file", help="Path to firmware .bin file to unpack")
-    fw_flash = fw_sub.add_parser("flash", help="Simulate a firmware update (live flashing is refused until the FOTA protocol is verified)")
+    fw_flash = fw_sub.add_parser(
+        "flash",
+        help="Update dongle or headset firmware from an official .bin package (simulated unless --confirm-risk)",
+        description="Without --confirm-risk this only simulates the update. A live update erases the device's "
+                    "separate firmware staging area, writes the package there, reads every page back, has the "
+                    "device check it, then commits; the device reboots and installs it. Nothing is installed "
+                    "before the commit, so a run that stops earlier leaves the current firmware in place.",
+    )
     fw_flash.add_argument("file", help="Path to firmware .bin file to flash")
     fw_flash.add_argument("--target", choices=["dongle", "headset"], default="dongle", help="Target node")
-    fw_flash.add_argument("--confirm-risk", action="store_true", help="Explicit confirmation gate for real hardware flashing")
+    fw_flash.add_argument("--confirm-risk", action="store_true", help="Write to real hardware (otherwise the update is simulated)")
+    fw_flash.add_argument("--experimental", action="store_true",
+                          help="Allow live updates of Maxwell 2 chips whose update commands are confirmed but a complete "
+                               "update has not been verified yet")
+    fw_flash.add_argument("--stage-only", action="store_true",
+                          help="Write and verify the package in the staging area, then stop without committing: "
+                               "nothing is installed")
+    fw_flash.add_argument("--pages-per-write", type=int, choices=[1, 2, 3], default=1,
+                          help="256-byte pages per write request (default 1; more is faster if the device accepts it)")
     fw_flash.add_argument("--dry-run", action="store_true", help="Simulate FOTA flash without transmitting live hardware writes")
     fw_flash.add_argument("--allow-downgrade", action="store_true", help="Permit flashing a package older than the installed firmware")
 
@@ -264,24 +279,57 @@ def main():
 
         elif args.firmware_action == "flash":
             from maxwell2.firmware import FirmwarePackage, FotaEngine, FotaSafetyError, FotaTransferError
+            from maxwell2.transport import DeviceBusyError
             pkg = FirmwarePackage(args.file)
             is_dry = args.dry_run or not args.confirm_risk
+            phase_names = {"erase": "Erasing staging area", "write": "Writing", "verify": "Reading back",
+                           "install": "Installing"}
+            shown = {"phase": None}
+
+            def progress(p):
+                if p["phase"] != shown["phase"]:
+                    if shown["phase"] is not None:
+                        sys.stdout.write("\n")
+                    shown["phase"] = p["phase"]
+                label = phase_names.get(p["phase"], p["phase"])
+                if p["phase"] == "erase":
+                    sys.stdout.write(f"\r    {label}... {'done' if p['done'] else '(can take a minute)'}  ")
+                elif p["phase"] == "install":
+                    seen = p.get("reported_version") or "Unknown"
+                    state = "rebooting / installing" if seen == "Unknown" else f"reports {seen}"
+                    sys.stdout.write(f"\r    Installing   {p['elapsed_sec']:5.0f}s: {state}. Do NOT unplug or power off.  ")
+                else:
+                    pct = p["percent"]
+                    bar = "█" * (pct // 4) + "░" * (25 - pct // 4)
+                    sys.stdout.write(f"\r    {label:<12} [{bar}] {pct:3d}% ({p['done']}/{p['total']} pages) "
+                                     f"{p['speed_kb_s']} KB/s, ETA {p['eta_sec']}s  ")
+                sys.stdout.flush()
 
             try:
                 transport = Transport(hidraw_path=args.device, dry_run=is_dry)
                 with transport:
                     client = MaxwellClient(transport)
                     engine = FotaEngine(
-                        pkg, target=args.target, client=client, dry_run=is_dry, allow_downgrade=args.allow_downgrade
+                        pkg, target=args.target, client=client, dry_run=is_dry, allow_downgrade=args.allow_downgrade,
+                        experimental=args.experimental, stage_only=args.stage_only,
+                        pages_per_write=args.pages_per_write,
                     )
 
                     # Run every safety check before asking for confirmation.
                     pre = engine.preflight_check()
 
                     if not is_dry:
-                        print("⚠ WARNING: You are about to flash physical hardware.")
-                        print("           Do NOT unplug the USB cable or power off the headset during flashing.")
+                        part = pre["fota_partition"]
+                        print("⚠ WARNING: You are about to write to physical hardware.")
                         print(f"           {args.target.upper()}: {pre['installed_version']} -> {pkg.version_string}")
+                        print(f"           Staging area 0x{part['address']:08X} (+0x{part['length']:X}) will be erased "
+                              f"and {pre['total_pages']} pages written to it.")
+                        if args.stage_only:
+                            print("           STAGE ONLY: the update stops before the commit, so nothing is installed.")
+                        else:
+                            print("           Do NOT unplug the USB cable or power off the headset until it finishes.")
+                        if pre["experimental"]:
+                            print("⚠ EXPERIMENTAL: a complete update of this chip has not been verified yet.")
                         word = "CONFIRM"
                         if pre["is_downgrade"]:
                             print("⚠ This is a DOWNGRADE to an older firmware version.")
@@ -294,15 +342,10 @@ def main():
                             print("\n[-] Flash aborted by user. Nothing was written.")
                             return
 
-                    print(f"[*] Starting FOTA Flash {'(DRY RUN)' if is_dry else '(LIVE HARDWARE)'}:")
+                    mode = "DRY RUN" if is_dry else ("LIVE, STAGE ONLY" if args.stage_only else "LIVE HARDWARE")
+                    print(f"[*] Starting firmware update ({mode}):")
                     print(f"    File: {pkg.filename} (Version: {pkg.version_string})")
-                    print(f"    Target Node: {args.target.upper()} • Total Chunks: {engine.total_chunks}")
-
-                    def progress(p):
-                        pct = p['percent']
-                        bar = "█" * (pct // 4) + "░" * (25 - pct // 4)
-                        sys.stdout.write(f"\r    [{bar}] {pct:3d}% ({p['current_chunk']}/{p['total_chunks']}) - {p['speed_kb_s']} KB/s - ETA: {p['eta_sec']}s  ")
-                        sys.stdout.flush()
+                    print(f"    Target: {args.target.upper()} • {engine.total_pages} pages of 256 bytes")
 
                     res = engine.execute(progress_callback=progress)
             except FotaTransferError as e:
@@ -311,15 +354,41 @@ def main():
             except FotaSafetyError as e:
                 print(f"[-] Flash refused: {e}")
                 sys.exit(1)
-            except (DeviceNotFoundError, DevicePermissionError) as e:
+            except KeyboardInterrupt:
+                print("\n[-] Flash aborted by user before the update started. Nothing was written.")
+                sys.exit(1)
+            except (DeviceNotFoundError, DevicePermissionError, DeviceBusyError) as e:
                 print(f"[-] {e}")
                 sys.exit(1)
 
-            print(f"\n✔ FOTA transfer finished in {res['duration_sec']}s ({res['chunks_sent']} chunks transferred).")
+            print(f"\n✔ Finished in {res['duration_sec']}s ({res['chunks_sent']} pages "
+                  f"{'simulated' if is_dry else 'written'}).")
+            if res.get("backup_file"):
+                print(f"  Settings saved beforehand to {res['backup_file']} ('backup show' to view).")
             if is_dry:
                 print("  Note: Dry-run simulation completed. No hardware flash bytes were modified.")
+            elif res["staged_only"]:
+                print(f"  ✔ Staged and verified: all {res['pages_verified']} pages read back identical and the device "
+                      "accepted the package.")
+                print(f"  Not committed, so nothing was installed: the {args.target} is still on {res['previous_version']}.")
             elif res["verification"] == "confirmed":
                 print(f"  ✔ {args.target.capitalize()} now reports {res['reported_version']}.")
+                if res.get("eq_restored"):
+                    slots = ", ".join(str(s) for s in res["eq_restored"])
+                    print(f"  ✔ The update reset custom EQ slot(s) {slots}; restored them from the pre-update snapshot.")
+                for err in res.get("eq_restore_errors") or []:
+                    print(f"  ✖ Could not restore {err}. The saved curves are in the backup above "
+                          "('eq custom <slot> --file' can write one back).")
+            elif res["verification"] == "still_staged":
+                print(f"  ✖ The {args.target} answers, but the package is still in its staging area, so it hasn't "
+                      "been installed yet. Leave it connected and powered for a few minutes, then run "
+                      "'firmware status'.")
+                sys.exit(4)
+            elif res["verification"] == "no_reboot_seen":
+                print(f"  ✖ Could not confirm the update: the {args.target} reports {res['reported_version']}, the same "
+                      "version as before, but it was never seen rebooting, so the install isn't proven. "
+                      "Power-cycle it and run 'firmware status'.")
+                sys.exit(4)
             else:
                 print(f"  ✖ Could not confirm the update: {args.target} reports {res['reported_version']} "
                       f"(expected {pkg.version_string}). Run 'firmware status' once the device has reconnected.")
