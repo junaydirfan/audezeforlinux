@@ -67,6 +67,16 @@ class DevicePermissionError(Exception):
     pass
 
 
+class DeviceBusyError(Exception):
+    """Raised when another audezeforlinux process holds the device (e.g. a firmware update)."""
+    pass
+
+
+class DeviceAbortError(ProtocolError):
+    """Raised when the device sends a command that ends the exchange (e.g. FOTA stop) instead of a reply."""
+    pass
+
+
 def list_maxwell_devices() -> List[dict]:
     """
     Scans sysfs to locate all connected Audeze Maxwell hidraw nodes.
@@ -125,11 +135,18 @@ class Transport:
         # A path given with --device is kept across reconnects while it still exists
         self.explicit_path = hidraw_path is not None
         self.lock = threading.RLock()
+        # Off during a firmware transfer: a device that drops off mid-flash must stop the transfer
+        self.auto_reconnect = True
+        # flock held on the device node: shared normally, exclusive during a firmware update
+        self.exclusive = False
         self.fd: Optional[int] = None
         self.is_dongle = True
         self.product_id: Optional[int] = None
         self.input_stream = InputStream()
         self.pending_notifications: List[bytes] = []
+        self.reconnect_count = 0  # lets callers notice the device went away (e.g. a reboot after an update)
+        # Kind of node opened (dongle or headset USB), unlike is_dongle which callers may override
+        self.node_is_dongle: Optional[bool] = None
 
     @classmethod
     def find_device(cls) -> Tuple[str, int, bool]:
@@ -161,6 +178,7 @@ class Transport:
             for dev in list_maxwell_devices():
                 if dev["path"] == self.hidraw_path:
                     self.product_id, self.is_dongle = dev["pid"], dev["is_dongle"]
+        self.node_is_dongle = self.is_dongle
 
         if not os.path.exists(self.hidraw_path):
             raise DeviceNotFoundError(f"Device node {self.hidraw_path} does not exist.")
@@ -176,8 +194,48 @@ class Transport:
                 f"Then unplug and replug your Audeze dongle/headset."
             )
 
+        try:
+            self._apply_lock()
+        except DeviceBusyError:
+            self.close()
+            raise
+
         # Drain any pending incoming reports
         self.drain()
+
+    def _apply_lock(self):
+        mode = fcntl.LOCK_EX if self.exclusive else fcntl.LOCK_SH
+        try:
+            fcntl.flock(self.fd, mode | fcntl.LOCK_NB)
+        except OSError as e:
+            if e.errno not in (errno.EWOULDBLOCK, errno.EAGAIN):
+                return  # the lock is an advisory guard between our own processes, not a requirement
+            raise DeviceBusyError(
+                f"{self.hidraw_path} is in use by another audezeforlinux process"
+                + (" (close the dashboard and any other instance before a firmware update)." if self.exclusive
+                   else ", probably a firmware update. Wait for it to finish.")
+            )
+
+    @_locked
+    def claim_exclusive(self):
+        """Takes sole use of the device for a firmware update, refusing while another instance has it open."""
+        if self.dry_run:
+            return
+        self.exclusive = True
+        try:
+            self._apply_lock()
+        except DeviceBusyError:
+            self.exclusive = False
+            self._apply_lock()
+            raise
+
+    @_locked
+    def release_exclusive(self):
+        if self.dry_run or not self.exclusive:
+            return
+        self.exclusive = False
+        if self.fd is not None:
+            self._apply_lock()
 
     def close(self):
         """Closes the hidraw file descriptor."""
@@ -189,13 +247,23 @@ class Transport:
             self.fd = None
 
     @_locked
-    def reconnect(self):
-        """Reopens the device after it re-enumerated, picking it up again under its new node."""
+    def reconnect(self, prefer_dongle: Optional[bool] = None):
+        """
+        Reopens the device after it re-enumerated, picking it up again under its new node.
+        prefer_dongle picks the kind of node to look for (default: the kind that was open).
+        """
+        self.reconnect_count += 1
+        was_dongle = self.node_is_dongle if prefer_dongle is None else prefer_dongle
         self.close()
-        # Node numbers get reused after re-enumeration, so only keep a path still held by a Maxwell
-        still_maxwell = any(dev["path"] == self.hidraw_path for dev in list_maxwell_devices())
-        if not (self.explicit_path and still_maxwell):
-            self.hidraw_path = None
+        devices = list_maxwell_devices()
+        # Node numbers get reused after re-enumeration, so only keep a path still held by the same
+        # kind of Maxwell node. Otherwise prefer a node of the same kind: after a dongle firmware
+        # update the dongle has to be found again, not the headset on USB-C, where route 0x00
+        # reaches the headset and its version would be mistaken for the dongle's.
+        same_path = any(d["path"] == self.hidraw_path and d["is_dongle"] == was_dongle for d in devices)
+        if not (self.explicit_path and same_path):
+            same_kind = next((d for d in devices if d["is_dongle"] == was_dongle), None) if was_dongle is not None else None
+            self.hidraw_path = same_kind["path"] if same_kind else None
         self.open()
 
     def __enter__(self):
@@ -279,12 +347,18 @@ class Transport:
             return reports
 
         if self.fd is None:
-            raise RuntimeError("Transport is not open.")
+            if not (reconnect and self.auto_reconnect and self.reconnect_count):
+                raise RuntimeError("Transport is not open.")
+            # An earlier reconnect found no device (e.g. headset and dongle both re-enumerating after
+            # a firmware update reboot) and left the transport closed: try again now. Without this,
+            # every later request failed with "not open" and the device was never picked up again.
+            self.reconnect()
+            return self._write_reports(race_packet, is_dongle)
 
         try:
             return self._write_reports(race_packet, is_dongle)
         except OSError as e:
-            if not reconnect or e.errno not in DEVICE_GONE_ERRNOS:
+            if not (reconnect and self.auto_reconnect) or e.errno not in DEVICE_GONE_ERRNOS:
                 raise
         # The route is re-read after reconnecting: the headset may now be on USB-C or the dongle.
         # A packet split over several reports may have been half sent, so it is resent whole.
@@ -349,14 +423,29 @@ class Transport:
 
         return packets
 
+    MAX_PENDING_NOTIFICATIONS = 64
+
+    def _keep_notification(self, packet: bytes):
+        # Bounded: a firmware update sends thousands of requests without a drain, and the
+        # dongle keeps emitting status notifications the whole time.
+        self.pending_notifications.append(packet)
+        del self.pending_notifications[:-self.MAX_PENDING_NOTIFICATIONS]
+
     @_locked
-    def exchange(self, race_packet: bytes, timeout_sec: float = 1.5) -> Optional[bytes]:
+    def exchange(self, race_packet: bytes, timeout_sec: float = 1.5, drain: bool = True,
+                 poll_interval: float = 0.02, abort_cmds: Tuple[int, ...] = (),
+                 is_dongle: Optional[bool] = None) -> Optional[bytes]:
         """
         Transmits a RACE packet and synchronously waits for its matching response.
         Any asynchronous notifications (0x5D) received along the way are cached in pending_notifications.
+        drain=False and a short poll_interval suit long runs of back-to-back requests (firmware
+        pages), where each reply is matched by command anyway and a full drain per request is slow.
+        abort_cmds: commands the *device* may send instead of replying (e.g. FOTA stop 0x1C03, sent
+        when it has ended an update session); receiving one raises DeviceAbortError straight away.
         """
-        self.drain()
-        self.write_race_packet(race_packet)
+        if drain:
+            self.drain()
+        self.write_race_packet(race_packet, is_dongle=is_dongle)
         if self.dry_run:
             return None
 
@@ -374,22 +463,30 @@ class Transport:
                         if direction == 0x5B and cmd == expected_cmd:
                             return p
                         elif direction == 0x5D:
-                            self.pending_notifications.append(p)
-            time.sleep(0.02)
+                            self._keep_notification(p)
+                        elif direction in (0x5A, 0x5C) and cmd in abort_cmds:
+                            raise DeviceAbortError(
+                                f"Device sent command 0x{cmd:04X} ({p[6:].hex(' ')}) instead of replying "
+                                f"to 0x{expected_cmd:04X}"
+                            )
+                continue  # more of a multi-report reply may already be waiting
+            time.sleep(poll_interval)
 
         raise TimeoutError(f"Timed out waiting for device response to command 0x{expected_cmd:04X} ({race_packet.hex(' ')})")
 
     @_locked
-    def query_notification(self, query_packet: bytes, timeout_sec: float = 2.0) -> Optional[bytes]:
+    def query_notification(self, query_packet: bytes, timeout_sec: float = 2.0,
+                           is_dongle: Optional[bool] = None) -> Optional[bytes]:
         """
         Sends a query (e.g. Battery 0x0CD6, Firmware 0x1C07) and waits for its 0x5D notification.
         Returns None on timeout, or straight away if the device's ACK reports an error status
         (no notification follows one), instead of waiting out the whole timeout.
+        is_dongle overrides the route for this query only (see write_race_packet).
         """
         # drain() also discards pending_notifications, which are all stale by now: an older
         # notification for this command would report an old value as the current one.
         self.drain()
-        self.write_race_packet(query_packet)
+        self.write_race_packet(query_packet, is_dongle=is_dongle)
         if self.dry_run:
             return None
 
@@ -408,7 +505,7 @@ class Transport:
                         elif direction == 0x5B and cmd == expected_cmd and len(p) >= 7 and p[6] != 0:
                             return None
                         elif direction == 0x5D:
-                            self.pending_notifications.append(p)
+                            self._keep_notification(p)
             time.sleep(0.02)
 
         return None

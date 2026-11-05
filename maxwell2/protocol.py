@@ -20,6 +20,8 @@ ROUTE_DIRECT = 0x00
 
 # RACE Protocol Constants
 SYNC_BYTE = 0x05
+SYNC_BYTE_FOTA = 0x15  # head byte of FOTA-family requests and their replies
+SYNC_BYTES = (SYNC_BYTE, SYNC_BYTE_FOTA)
 DIRECTION_REQUEST = 0x5A
 DIRECTION_RESPONSE = 0x5B
 DIRECTION_NOTIFICATION = 0x5D
@@ -97,12 +99,14 @@ class ProtocolError(ValueError):
     pass
 
 
-def build_race_packet(command: int, payload: bytes = b"") -> bytes:
-    """Builds a RACE packet: 0x05 0x5A <len_le16> <cmd_le16> <payload>."""
+def build_race_packet(command: int, payload: bytes = b"", head: int = SYNC_BYTE) -> bytes:
+    """Builds a RACE packet: <head> 0x5A <len_le16> <cmd_le16> <payload>. head is 0x05, or 0x15 for FOTA."""
+    if head not in SYNC_BYTES:
+        raise ProtocolError(f"Unknown RACE head byte 0x{head:02X}")
     length = len(payload) + 2
     if length > 1024:
         raise ProtocolError(f"RACE payload too large ({length} bytes)")
-    return struct.pack("<BBHH", SYNC_BYTE, DIRECTION_REQUEST, length, command) + payload
+    return struct.pack("<BBHH", head, DIRECTION_REQUEST, length, command) + payload
 
 
 def parse_race_packet(packet: bytes, expected_dir: Optional[int] = None) -> Tuple[int, bytes]:
@@ -113,7 +117,7 @@ def parse_race_packet(packet: bytes, expected_dir: Optional[int] = None) -> Tupl
     if len(packet) < 6:
         raise ProtocolError(f"Packet too short for RACE header ({len(packet)} bytes)")
     sync, direction, length, command = struct.unpack_from("<BBHH", packet, 0)
-    if sync != SYNC_BYTE:
+    if sync not in SYNC_BYTES:
         raise ProtocolError(f"Invalid RACE sync byte: 0x{sync:02X}")
     if expected_dir is not None and direction != expected_dir:
         raise ProtocolError(f"Unexpected RACE direction: 0x{direction:02X} (expected 0x{expected_dir:02X})")
@@ -167,14 +171,14 @@ class InputStream:
 
         packets = []
         while len(self.buffer) >= 6:
-            if self.buffer[0] != SYNC_BYTE:
-                # Self-healing stream: search forward for next SYNC_BYTE (0x05)
-                sync_pos = self.buffer.find(bytes([SYNC_BYTE]))
-                if sync_pos == -1:
+            if self.buffer[0] not in SYNC_BYTES:
+                # Self-healing stream: search forward for the next head byte (0x05, or 0x15 for FOTA)
+                positions = [p for p in (self.buffer.find(bytes([s])) for s in SYNC_BYTES) if p != -1]
+                if not positions:
                     self.buffer.clear()
                     break
                 else:
-                    del self.buffer[:sync_pos]
+                    del self.buffer[:min(positions)]
                     if len(self.buffer) < 6:
                         break
 

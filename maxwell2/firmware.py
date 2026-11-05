@@ -12,14 +12,41 @@ import binascii
 import re
 import lzma
 import time
+from contextlib import contextmanager
 from typing import Optional, Dict, Any, List, Tuple, Callable
 
+from maxwell2.backup import create_backup
 from maxwell2.client import MaxwellClient
-from maxwell2.transport import ANC_PIDS
+from maxwell2.transport import ANC_PIDS, DeviceAbortError, DeviceBusyError, list_maxwell_devices
 from maxwell2.protocol import (
     build_firmware_command,
     parse_firmware_notification,
     CMD_FIRMWARE,
+    CHUNK_MAX,
+    ProtocolError,
+)
+from maxwell2.fota import (
+    CMD_FOTA_STOP,
+    FOTA_STATE_START_1,
+    FOTA_STATE_START_2,
+    FOTA_STATE_DOWNLOADED,
+    MAX_PAGES_PER_WRITE,
+    PAGE_SIZE,
+    build_commit,
+    build_fota_start,
+    build_integrity_check,
+    build_page_program,
+    build_page_read,
+    build_partition_erase,
+    build_partition_info_query,
+    build_start_transaction,
+    build_write_state,
+    pad_to_pages,
+    parse_page_program,
+    parse_page_read,
+    parse_partition_info,
+    parse_status_response,
+    ranges_overlap,
 )
 
 
@@ -121,11 +148,11 @@ FIRMWARE_CATALOG = {
 }
 
 
-# TLV 0x0020 chip identifiers -> (flash target, live FOTA flashing allowed).
+# TLV 0x0020 chip identifiers -> (flash target, live FOTA flashing verified).
 # AB1565_ULL2_DONGLE / AB1585_Headset are what the official Maxwell 2 packages
-# (v1.0.5.7.4 and the v1.0.2.60.2 rollback) report. The RACE 0x15 block framing in
-# FotaEngine has not been checked against captures of the official updater on any chip,
-# so live flashing is blocked for all of them until it is.
+# (v1.0.5.7.4 and the v1.0.2.60.2 rollback) report. None is marked verified until a complete
+# flash has been confirmed on hardware; the Maxwell 2 chips can be flashed with
+# experimental=True (see FOTA_EXPERIMENTAL_CHIPS). The AB1568 (Maxwell 1) is untested.
 KNOWN_CHIP_IDS: Dict[str, Tuple[str, bool]] = {
     "AB1568_Dongle": ("dongle", False),
     "AB1568_Headset": ("headset", False),
@@ -142,6 +169,8 @@ KNOWN_PACKAGE_TRACKS: Dict[str, str] = {
     # sha256 of the whole file -> catalog track
     "b16ecc9793d6ab9530dc45805cc486061f302fa389e9215f66d81fb587571a39": "maxwell2_anc",  # Maxwell2ANC_PS_dongle_v1.0.5.6.bin
     "2d5149fc5859c8c437b83fe2d4b83b8068ab9d9038ae61704c73640be90c6f9a": "maxwell2_anc",  # Maxwell2ANC_PS_headset_v1.0.5.6.bin
+    "6eee723fda209d91744381a2b1f6c41b3df4d6e045f6038e7766b5d450b20259": "maxwell2",  # Maxwell2_XBOX_dongle_v1.0.5.7.4.bin
+    "a3c3d54183628dee68655aef204ece820b49fed6f8aaaffbd3407672b01afe4a": "maxwell2",  # Maxwell2_XBOX_headset_v1.0.5.7.4.bin
 }
 
 
@@ -343,11 +372,15 @@ class FirmwarePackage:
 
         # 2. Individual partitions
         offset = 0
-        names = ["partition_1_bootloader", "partition_2_kernel_app", "partition_3_dsp_audio", "partition_4_nvdm_defaults"]
+        # Roles are only known for the 4-partition AB1568 (Maxwell 1) layout; other packages get
+        # neutral names with their flash address (e.g. Maxwell 2 partition 1 holds DSP code).
+        ab1568_names = ["partition_1_bootloader", "partition_2_kernel_app", "partition_3_dsp_audio",
+                        "partition_4_nvdm_defaults"]
+        known_roles = self.chip_id.startswith("AB1568") and len(self.partitions) == len(ab1568_names)
         for idx, p in enumerate(self.partitions):
             sz = p["decompressed_size"]
             chunk = data[offset : offset + sz]
-            p_name = names[idx] if idx < len(names) else f"partition_{idx + 1}"
+            p_name = ab1568_names[idx] if known_roles else f"partition_{idx + 1}_0x{p['dst_flash_addr']:08X}"
             p_file = os.path.join(output_dir, f"{self.filename}_{p_name}.bin")
             with open(p_file, "wb") as f:
                 f.write(chunk)
@@ -420,7 +453,9 @@ def get_firmware_diagnostics(client: MaxwellClient) -> Dict[str, Any]:
 
     # 2. Query Battery
     batt_pct = client.get_battery()
-    batt_safe = (batt_pct is not None and batt_pct >= 50)
+    usb_powered = headset_usb_powered(client)
+    batt_needed = required_battery_pct(usb_powered)
+    batt_safe = (batt_pct is not None and batt_pct >= batt_needed)
 
     # 3. Parity check
     parity = (dongle_ok and headset_ok and dongle_fw == headset_fw)
@@ -445,6 +480,8 @@ def get_firmware_diagnostics(client: MaxwellClient) -> Dict[str, Any]:
         "parity_match": parity,
         "battery_percent": batt_pct,
         "battery_safe_for_flashing": batt_safe,
+        "battery_required_percent": batt_needed,
+        "usb_powered": usb_powered,
         "update_prerequisites_met": safe_to_update,
         "connection_mode": conn_mode,
     }
@@ -557,50 +594,98 @@ class FotaInterruptedError(FotaTransferError):
 
 
 MIN_HEADSET_BATTERY_PCT = 50
+# While the headset charges over USB, its reading runs high: on a Maxwell 2 it read 85% on the
+# charger and settled at 62% a minute after unplugging, and an earlier 34% became 72% within two
+# minutes of plugging in. 90% on the charger is roughly 50% real charge.
+MIN_HEADSET_BATTERY_PCT_CHARGING = 90
+# After plugging in or unplugging, the reading moves about 1 point every 2 s for up to a minute
+# before it settles, so preflight waits until two readings this far apart agree.
+BATTERY_SETTLE_INTERVAL_SEC = 3.0
+BATTERY_SETTLE_TIMEOUT_SEC = 120.0
+
+
+def required_battery_pct(usb_powered: Optional[bool]) -> int:
+    """Minimum headset reading for an update. Unknown power state counts as charging (the stricter case)."""
+    return MIN_HEADSET_BATTERY_PCT if usb_powered is False else MIN_HEADSET_BATTERY_PCT_CHARGING
+
+
+def headset_usb_powered(client) -> Optional[bool]:
+    """True if the headset is on USB power (it's reachable as its own USB node), None if unknown."""
+    transport = getattr(client, "transport", None)
+    if transport is not None and getattr(transport, "is_dongle", True) is False:
+        return True  # talking to the headset's own USB node
+    check = getattr(client, "is_usb_powered", None)
+    if check is None:
+        return None
+    try:
+        return bool(check())
+    except Exception:
+        return None
+
+# Maxwell 2 chips whose FOTA commands have been confirmed on real hardware with read-only
+# requests (partition query, page reads, relay through the dongle), but not yet through a
+# complete flash. Live flashing them needs experimental=True (CLI: --experimental).
+FOTA_EXPERIMENTAL_CHIPS = ("AB1565_ULL2_DONGLE", "AB1585_Headset")
+
+FOTA_COMMAND_TIMEOUT_SEC = 5.0
+FOTA_ERASE_TIMEOUT_SEC = 120.0       # the headset staging area is 3.2 MB of flash
+FOTA_INTEGRITY_TIMEOUT_SEC = 60.0
+FOTA_PAGE_TIMEOUT_SEC = 3.0
+FOTA_PAGE_ATTEMPTS = 4               # one try plus three retries, like race-toolkit
+FOTA_POLL_INTERVAL_SEC = 0.0005
+FOTA_INSTALL_TIMEOUT_SEC = 600.0     # the bootloader unpacks the image after commit (duration unmeasured)
+
+FOTA_PHASES = ("start", "erase", "write", "verify", "integrity", "commit", "install")
 
 
 class FotaSimulator:
-    """
-    Simulates the Airoha FOTA block streaming protocol (as implemented for AB1568) without writing to hardware.
-    Validates chunk fragmentation, handshake packets, and transfer duration estimates.
-    """
+    """Describes the FOTA plan for a package (steps, pages, HID reports) without touching hardware."""
 
-    def __init__(self, package: FirmwarePackage, target: str = "dongle"):
+    def __init__(self, package: FirmwarePackage, target: str = "dongle", pages_per_write: int = 1):
         self.package = package
         self.target = target.lower()  # "dongle" or "headset"
-        self.chunk_size = 56  # Payload bytes per Report 0x06 (cbreak safe)
+        self.pages_per_write = pages_per_write
         self.total_bytes = package.file_size
-        self.total_chunks = (self.total_bytes + self.chunk_size - 1) // self.chunk_size
+        self.total_pages = len(pad_to_pages(bytes(package.raw_data))) // PAGE_SIZE
+        self.total_writes = (self.total_pages + pages_per_write - 1) // pages_per_write
+        packet_size = 6 + 2 + (5 + PAGE_SIZE) * pages_per_write
+        self.reports_per_write = (packet_size + CHUNK_MAX - 1) // CHUNK_MAX
 
     def simulate_transfer(self) -> Dict[str, Any]:
-        """Simulates FOTA transmission parameters."""
-        route = 0x00 if self.target == "dongle" else 0x80
-        est_duration_sec = self.total_chunks * 0.015  # ~15ms per chunk over USB HID
-
         return {
             "target": self.target,
-            "route_byte": f"0x{route:02X}",
+            "route_byte": "0x00" if self.target == "dongle" else "0x80 through a dongle, 0x00 over USB-C",
             "firmware_version": self.package.version_string,
             "chip_target": self.package.chip_id,
             "total_bytes": self.total_bytes,
-            "chunk_payload_size": self.chunk_size,
-            "total_hid_reports": self.total_chunks,
-            "estimated_duration_sec": round(est_duration_sec, 1),
-            "dual_bank_recovery_active": True,
-            "handshake_init": "0x0101 (Airoha FotaInit)",
-            "fota_start_opcode": "0x1C02 (FotaStart)",
+            "total_pages": self.total_pages,
+            "page_writes": self.total_writes,
+            "total_hid_reports": self.total_writes * self.reports_per_write,
+            # Measured on a Maxwell 2 headset over USB-C: ~8 ms per page read; writes are similar.
+            "estimated_duration_sec": round(self.total_pages * 0.018 + 30, 1),
+            "steps": [
+                "0x1C00 query FOTA partition", "0x1C08 start", "0x1C0A start transaction",
+                "0x1C06 state 0x0201, 0x0210", "0x0404 erase partition", "0x0402 write pages",
+                "0x0403 read back every page", "0x1C01 integrity check", "0x1C06 state 0x0211",
+                "0x1C02 commit (device reboots and installs)",
+            ],
         }
 
 
 class FotaEngine:
     """
-    Airoha FOTA streaming engine. Live writes are only allowed for chips marked as
-    supported in KNOWN_CHIP_IDS, which is currently none: the block framing has not been
-    verified against the official updater. Dry runs exercise everything except the writes.
+    Airoha FOTA engine (see maxwell2/fota.py for the protocol).
 
-    Live flashing fails closed: every device fact it depends on (connection, route,
-    installed version, firmware track, headset battery) must be read successfully, or
-    preflight refuses. After streaming, the target's version is read back.
+    Live run: preflight -> start session -> erase the staging partition -> write every page ->
+    read every page back and compare -> device integrity check -> commit (the device reboots and
+    its bootloader installs the image) -> read the version back.
+
+    Nothing is installed before commit: a run that stops earlier, for any reason, leaves the
+    device on its current firmware. stage_only stops after the integrity check on purpose.
+
+    Live writes are allowed only for chips verified in KNOWN_CHIP_IDS (currently none), or for
+    FOTA_EXPERIMENTAL_CHIPS when experimental=True. Every device fact the flash depends on must
+    be read successfully, or preflight refuses.
     """
 
     def __init__(
@@ -612,9 +697,14 @@ class FotaEngine:
         device_track: Optional[str] = None,
         installed_version: Optional[str] = None,
         allow_downgrade: bool = False,
-        readback_timeout_sec: float = 60.0,
+        experimental: bool = False,
+        stage_only: bool = False,
+        pages_per_write: int = 1,
+        readback_timeout_sec: float = FOTA_INSTALL_TIMEOUT_SEC,
         readback_interval_sec: float = 2.0,
     ):
+        if not 1 <= pages_per_write <= MAX_PAGES_PER_WRITE:
+            raise ValueError(f"pages_per_write must be 1..{MAX_PAGES_PER_WRITE}, got {pages_per_write}")
         self.package = package
         self.target = target.lower()
         self.client = client
@@ -623,13 +713,32 @@ class FotaEngine:
         # Firmware version currently on the target node; read from the device if None.
         self.installed_version = installed_version
         self.allow_downgrade = allow_downgrade
+        self.experimental = experimental
+        self.stage_only = stage_only
+        self.pages_per_write = pages_per_write
         self.dry_run = dry_run
         self.readback_timeout_sec = readback_timeout_sec
         self.readback_interval_sec = readback_interval_sec
-        self.chunk_size = 56
+        self.image = pad_to_pages(bytes(package.raw_data))
         self.total_bytes = package.file_size
-        self.total_chunks = (self.total_bytes + self.chunk_size - 1) // self.chunk_size
+        self.total_pages = len(self.image) // PAGE_SIZE
+        self.total_chunks = self.total_pages  # one chunk = one 256-byte page
+        self.chunk_size = PAGE_SIZE
+        self.fota_partition: Optional[Dict[str, int]] = None
+        self.relay: Optional[bool] = None
+        self.node: Optional[Tuple[Any, Any, Any]] = None  # (hidraw path, product id, is_dongle) at preflight
+        self.phase = "preflight"
+        self.pages_written = 0
+        self.pages_verified = 0
+        self.backup_file: Optional[str] = None
         self.cancelled = False
+        self.reboot_seen = False  # the device went away after the commit (see _verify_installed_version)
+        self.settings_snapshot: Optional[Dict[str, Any]] = None  # dump_all() taken before the update
+        self.eq_restore: Optional[Dict[str, Any]] = None
+
+    # --------------------------------------------------------------------------
+    # Device access
+    # --------------------------------------------------------------------------
 
     def _live_transport(self):
         if self.client is None or getattr(self.client, "transport", None) is None:
@@ -645,16 +754,112 @@ class FotaEngine:
         route 0x00 reaches the dongle and 0x80 is relayed to the headset; over direct
         USB-C, route 0x00 is the headset itself.
         """
-        connected_via_dongle = self._live_transport().is_dongle
+        transport = self._live_transport()
+        connected_via_dongle = transport.is_dongle
+        # The route only means something for this exact node, so pin it (see _target_route). A second
+        # preflight (execute() runs it again after the CLI's confirmation prompt) must find the same one.
+        node = self._node_identity(transport)
+        if self.node is not None and node != self.node:
+            raise FotaSafetyError(
+                f"The connection changed since the checks ran (was {self.node[0]}, now {node[0]}): "
+                "the device was unplugged or re-enumerated. Nothing was written; run the update again."
+            )
+        self.node = node
         if self.target == "dongle":
             if not connected_via_dongle:
                 raise FotaSafetyError("Target is the DONGLE, but the connected device is not a dongle.")
             return False
         return connected_via_dongle
 
+    @staticmethod
+    def _node_identity(transport) -> Tuple[Any, Any, Any]:
+        return (transport.hidraw_path, transport.product_id, transport.is_dongle)
+
+    @contextmanager
+    def _target_route(self):
+        """
+        Holds the transport and points every request at the target node. Refuses if the transport
+        is no longer on the node preflight checked: after a reconnect (headset unplugged from USB-C,
+        now reached through the dongle) the same route byte reaches a different device, so the
+        headset package could otherwise be sent to the dongle. No reconnect is allowed inside.
+        """
+        transport = self._live_transport()
+        with transport.lock:
+            if self.node is not None and self._node_identity(transport) != self.node:
+                raise FotaSafetyError(
+                    f"The connection changed since the checks ran (was {self.node[0]}, now {transport.hidraw_path}): "
+                    "the device was unplugged or re-enumerated. Nothing was written; run the update again."
+                )
+            previous_route, previous_reconnect = transport.is_dongle, transport.auto_reconnect
+            transport.is_dongle = self.relay
+            transport.auto_reconnect = False
+            try:
+                yield transport
+            finally:
+                transport.is_dongle = previous_route
+                transport.auto_reconnect = previous_reconnect
+
+    def _command(self, transport, packet: bytes, timeout: Optional[float] = None) -> None:
+        cmd = struct.unpack_from("<H", packet, 4)[0]
+        resp = transport.exchange(packet, timeout_sec=FOTA_COMMAND_TIMEOUT_SEC if timeout is None else timeout,
+                                  abort_cmds=(CMD_FOTA_STOP,))
+        parse_status_response(resp, cmd)
+
+    def _open_session(self, transport) -> None:
+        """
+        Starts (or restarts) the device's update session. The device ends a session that has been
+        idle for a while, sending FOTA stop (0x1C03) instead of answering the next update command;
+        reading pages back doesn't count as activity. Seen on a Maxwell 2 headset: after the ~70 s
+        read-back, the integrity check got a stop. Restarting the session leaves the staged data as
+        it is (race-toolkit relies on this to re-check an already staged package).
+        """
+        for packet in (build_fota_start(), build_start_transaction(),
+                       build_write_state(FOTA_STATE_START_1), build_write_state(FOTA_STATE_START_2)):
+            if self.cancelled:
+                raise KeyboardInterrupt
+            self._command(transport, packet)
+
+    def _query_fota_partition(self) -> Dict[str, int]:
+        try:
+            with self._target_route() as transport:
+                return parse_partition_info(transport.exchange(build_partition_info_query(), timeout_sec=FOTA_COMMAND_TIMEOUT_SEC))
+        except (ProtocolError, TimeoutError, OSError) as e:
+            raise FotaSafetyError(f"Could not read the {self.target}'s FOTA partition: {e}")
+
+    def _settled_battery(self) -> Optional[int]:
+        """Reads the battery until two readings BATTERY_SETTLE_INTERVAL_SEC apart agree."""
+        deadline = time.time() + BATTERY_SETTLE_TIMEOUT_SEC
+        last = self.client.get_battery()
+        while last is not None:
+            time.sleep(BATTERY_SETTLE_INTERVAL_SEC)
+            now = self.client.get_battery()
+            if now == last:
+                return now
+            if time.time() >= deadline:
+                raise FotaSafetyError(
+                    f"The headset battery reading is still changing ({last}% -> {now}%), as it does for about a "
+                    "minute after plugging in or unplugging. Wait a minute and try again."
+                )
+            last = now
+        return None
+
     def _read_target_version(self) -> str:
+        if self.target == "dongle":
+            transport = self.client.transport
+            if getattr(transport, "is_dongle", True) is False:
+                # On the headset's USB node, route 0x00 reaches the headset, and its version could pass
+                # for the dongle's (e.g. after the dongle rebooted and the transport picked the headset).
+                if not any(d["is_dongle"] for d in list_maxwell_devices()):
+                    return "Unknown"
+                transport.reconnect(prefer_dongle=True)
+                if transport.is_dongle is False:
+                    return "Unknown"
         fw = self.client.get_firmware()
         return str(fw.get(self.target, "Unknown")).strip() or "Unknown"
+
+    # --------------------------------------------------------------------------
+    # Preflight
+    # --------------------------------------------------------------------------
 
     def preflight_check(self) -> Dict[str, Any]:
         """
@@ -663,10 +868,13 @@ class FotaEngine:
         2. Every internal partition SHA-256 hash.
         3. Chip ID is known (KNOWN_CHIP_IDS) and built for the selected target.
            The package's firmware track (e.g. regular vs ANC Maxwell 2) must match the device's.
-           Live flashing additionally requires a chip whose FOTA framing is verified.
-        4. Live only: connected device and route, installed version, firmware track,
-           downgrade confirmation, and headset battery >= 50%. Any of these that cannot
-           be read is a refusal, not a pass.
+           Live flashing additionally requires a verified chip, or an experimental one with
+           experimental=True.
+        4. Live only: connected device and route, installed version, firmware track, downgrade
+           confirmation, headset battery (a settled reading of >= 50%, or >= 90% while charging,
+           since readings on the charger run high), and the device's FOTA partition: readable, big
+           enough for the package, and clear of every flash range the package installs to.
+           Any of these that cannot be read is a refusal, not a pass.
         """
         # 1. Package integrity
         if not self.package.outer_hash_valid:
@@ -702,17 +910,23 @@ class FotaEngine:
         installed = self.installed_version
         is_downgrade = bool(installed) and parse_version_tuple(self.package.version_string) < parse_version_tuple(installed)
         batt_pct = None
-        relay = None
 
         if not self.dry_run:
-            if not live_supported:
+            experimental_ok = self.experimental and actual_chip in FOTA_EXPERIMENTAL_CHIPS
+            if not (live_supported or experimental_ok):
+                if actual_chip in FOTA_EXPERIMENTAL_CHIPS:
+                    raise FotaSafetyError(
+                        f"Live flashing of {actual_chip} is not supported yet without --experimental: the FOTA "
+                        "commands answer correctly on a Maxwell 2, but a complete flash hasn't been verified. "
+                        "Use --dry-run to simulate the transfer."
+                    )
                 raise FotaSafetyError(
-                    f"Live flashing of {actual_chip} is not supported yet: the FOTA packet framing has not been "
-                    "verified against the official updater on this chip. Use --dry-run to simulate the transfer."
+                    f"Live flashing of {actual_chip} is not supported yet: the FOTA protocol has not been "
+                    "verified on this chip. Use --dry-run to simulate the transfer."
                 )
 
             # 3. Device connection and route
-            relay = self._relay_via_dongle()
+            self.relay = self._relay_via_dongle()
 
             # 4. Installed version and firmware track
             if not installed:
@@ -749,16 +963,43 @@ class FotaEngine:
 
             # 6. Battery (headset only; the dongle is bus powered)
             if self.target == "headset":
+                usb_powered = headset_usb_powered(self.client)
                 try:
-                    batt_pct = self.client.get_battery()
+                    batt_pct = self._settled_battery()
+                except FotaSafetyError:
+                    raise
                 except Exception as e:
                     raise FotaSafetyError(f"Could not read the headset battery level: {e}")
                 if batt_pct is None:
                     raise FotaSafetyError("Could not read the headset battery level: refusing to flash.")
-                if batt_pct < MIN_HEADSET_BATTERY_PCT:
+                needed = required_battery_pct(usb_powered)
+                if batt_pct < needed:
+                    if needed == MIN_HEADSET_BATTERY_PCT:
+                        raise FotaSafetyError(
+                            f"Headset battery is {batt_pct}%. Minimum {needed}% required for flashing safety."
+                        )
                     raise FotaSafetyError(
-                        f"Headset battery is {batt_pct}%. Minimum {MIN_HEADSET_BATTERY_PCT}% required for flashing safety."
+                        f"Headset battery reads {batt_pct}% while charging. Readings on the charger run up to "
+                        f"~40 points high, so {needed}% is required while charging ({MIN_HEADSET_BATTERY_PCT}% "
+                        "otherwise). Let it charge further and try again."
                     )
+
+            # 7. Staging partition, as reported by the device
+            part = self._query_fota_partition()
+            if len(self.image) > part["length"]:
+                raise FotaSafetyError(
+                    f"Package ({len(self.image)} bytes) does not fit the {self.target}'s FOTA partition "
+                    f"({part['length']} bytes): wrong package for this device?"
+                )
+            staging = (part["address"], part["length"])
+            for p in self.package.partitions:
+                dest = (p["dst_flash_addr"], p["decompressed_size"])
+                if ranges_overlap(staging, dest):
+                    raise FotaSafetyError(
+                        f"The device's FOTA partition 0x{staging[0]:08X}+0x{staging[1]:X} overlaps package partition "
+                        f"0x{dest[0]:08X}+0x{dest[1]:X}: refusing, since erasing it could damage installed firmware."
+                    )
+            self.fota_partition = part
 
         return {
             "package_valid": True,
@@ -769,121 +1010,357 @@ class FotaEngine:
             "version": self.package.version_string,
             "installed_version": installed,
             "is_downgrade": is_downgrade,
-            "relay_via_dongle": relay,
+            "relay_via_dongle": self.relay,
+            "fota_partition": self.fota_partition,
             "total_bytes": self.total_bytes,
+            "total_pages": self.total_pages,
             "total_chunks": self.total_chunks,
             "battery_percent": batt_pct,
+            "experimental": self.experimental and actual_chip in FOTA_EXPERIMENTAL_CHIPS,
+            "stage_only": self.stage_only,
             "dry_run": self.dry_run,
         }
 
-    def _transfer_stopped_message(self, reason: str, chunks_sent: int) -> str:
+    # --------------------------------------------------------------------------
+    # Transfer
+    # --------------------------------------------------------------------------
+
+    def _report(self, callback, done: int, total: int, start: float):
+        if not callback:
+            return
+        elapsed = max(0.001, time.time() - start)
+        rate = done / elapsed
+        callback({
+            "phase": self.phase,
+            "done": done,
+            "total": total,
+            "percent": int(done * 100 / total) if total else 100,
+            "current_chunk": done,
+            "total_chunks": total,
+            "elapsed_sec": round(elapsed, 1),
+            "speed_kb_s": round(rate * PAGE_SIZE / 1024.0, 1),
+            "eta_sec": round((total - done) / rate, 1) if rate > 0 else 0.0,
+            "done_all": done >= total,
+        })
+
+    def _write_pages(self, transport, address: int, data: bytes):
+        """Writes one batch of pages, retrying on a NAK, a checksum error or a missing reply."""
+        packet = build_page_program(address, data)
+        last_error: Optional[Exception] = None
+        for attempt in range(FOTA_PAGE_ATTEMPTS):
+            try:
+                # On a retry, flush first: a late reply to the earlier attempt must not be taken for this one
+                resp = transport.exchange(packet, timeout_sec=FOTA_PAGE_TIMEOUT_SEC, drain=attempt > 0,
+                                          poll_interval=FOTA_POLL_INTERVAL_SEC, abort_cmds=(CMD_FOTA_STOP,))
+                parse_page_program(resp, address, len(data) // PAGE_SIZE)
+                return
+            except DeviceAbortError:
+                raise  # the device ended the session: retrying the page can't help
+            except (ProtocolError, TimeoutError) as e:
+                last_error = e
+        raise ProtocolError(f"Page write at 0x{address:08X} failed after {FOTA_PAGE_ATTEMPTS} attempts: {last_error}")
+
+    def _read_page(self, transport, address: int) -> bytes:
+        last_error: Optional[Exception] = None
+        for attempt in range(FOTA_PAGE_ATTEMPTS):
+            try:
+                resp = transport.exchange(build_page_read(address), timeout_sec=FOTA_PAGE_TIMEOUT_SEC,
+                                          drain=attempt > 0, poll_interval=FOTA_POLL_INTERVAL_SEC,
+                                          abort_cmds=(CMD_FOTA_STOP,))
+                return parse_page_read(resp, address)
+            except DeviceAbortError:
+                raise
+            except (ProtocolError, TimeoutError) as e:
+                last_error = e
+        raise ProtocolError(f"Page read at 0x{address:08X} failed after {FOTA_PAGE_ATTEMPTS} attempts: {last_error}")
+
+    def _stopped_message(self, reason: str) -> str:
+        if self.phase == "start":
+            written = "Nothing was written to the firmware staging area."
+        elif self.phase == "erase":
+            written = "The staging area may be partly erased, but no firmware pages were written to it."
+        else:
+            written = (f"{self.pages_written} of {self.total_pages} pages had been written to the staging area; "
+                       "the next update attempt erases them.")
         return (
-            f"{reason} after {chunks_sent} of {self.total_chunks} chunks. Do NOT unplug or power off the device. "
-            "It should still be running its previous firmware, but this tool has not verified the dual-bank "
-            "fallback. Check with 'firmware status' before doing anything else."
+            f"{reason} during the {self.phase} step. {written} Nothing was installed: the commit step was never "
+            f"sent, so the {self.target} is still running {self.installed_version or 'its current firmware'}. "
+            "Run 'firmware status' to check, then retry."
         )
 
-    def _verify_installed_version(self) -> Dict[str, Any]:
-        """Polls the target's version until it reports the package version or the timeout expires."""
-        expected = parse_version_tuple(self.package.version_string)
-        deadline = time.time() + self.readback_timeout_sec
-        last_seen = "Unknown"
-        while True:
+    def _snapshot_settings(self):
+        """Saves headset settings and custom EQ before an update, in case the new firmware resets them."""
+        dump = getattr(self.client, "dump_all", None)
+        if dump is None:
+            return
+        try:
+            self.settings_snapshot = dump()
+            self.backup_file = create_backup("pre_firmware_update", self.settings_snapshot)
+        except Exception:
+            self.backup_file = None  # a failed snapshot doesn't make the update unsafe
+
+    @staticmethod
+    def _eq_curve(bands) -> List[Tuple[float, float]]:
+        return [(float(b.get("frequency_hz", 0)), float(b.get("gain_db", 0))) for b in bands or []]
+
+    def _restore_custom_eq(self) -> Dict[str, Any]:
+        """
+        Rewrites every custom EQ slot that differs from the pre-update snapshot. Seen on a Maxwell 2
+        headset: a full update reset the custom EQ slots to flat but kept the preset, sidetone,
+        chat mix and noise reduction. The active preset isn't changed. Errors are reported, not raised:
+        the update itself has already succeeded.
+        """
+        restored: List[int] = []
+        errors: List[str] = []
+        saved_slots = (self.settings_snapshot or {}).get("custom_eq_profiles") or {}
+        read = getattr(self.client, "read_custom_eq", None)
+        write = getattr(self.client, "write_custom_eq", None)
+        if not saved_slots or read is None or write is None:
+            return {"restored": restored, "errors": errors}
+        for slot in range(4):
+            bands = (saved_slots.get(f"custom_slot_{slot + 1}") or {}).get("bands")
+            if not bands:
+                continue  # that slot couldn't be read before the update
             try:
-                last_seen = self._read_target_version()
-            except Exception:
-                # Expected while the device reboots into the new image.
-                pass
-            if last_seen != "Unknown" and parse_version_tuple(last_seen) == expected:
-                return {"verification": "confirmed", "reported_version": last_seen}
-            if time.time() >= deadline:
-                break
-            time.sleep(self.readback_interval_sec)
-        status = "no_response" if last_seen == "Unknown" else "version_mismatch"
-        return {"verification": status, "reported_version": last_seen}
+                if self._eq_curve(read(slot).get("bands")) == self._eq_curve(bands):
+                    continue
+                write(slot, bands, activate=False)
+                restored.append(slot + 1)
+            except Exception as e:
+                errors.append(f"custom EQ slot {slot + 1}: {e}")
+        return {"restored": restored, "errors": errors}
+
+    def _simulate(self, progress_callback, start: float) -> Dict[str, Any]:
+        self.phase = "write"
+        for done in range(0, self.total_pages + 1, max(1, self.total_pages // 50)):
+            if self.cancelled:
+                raise FotaInterruptedError("FOTA flash cancelled (dry run, nothing was written).", 0, self.total_pages)
+            self._report(progress_callback, done, self.total_pages, start)
+        self._report(progress_callback, self.total_pages, self.total_pages, start)
+        return {
+            "success": True,
+            "target": self.target,
+            "version": self.package.version_string,
+            "previous_version": self.installed_version,
+            "total_bytes": self.total_bytes,
+            "total_pages": self.total_pages,
+            "chunks_sent": self.total_pages,
+            "duration_sec": round(time.time() - start, 2),
+            "dry_run": True,
+            "staged_only": self.stage_only,
+            "verification": "skipped (dry run)",
+            "reported_version": None,
+            "backup_file": None,
+        }
 
     def execute(self, progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None) -> Dict[str, Any]:
         """
-        Executes the FOTA block streaming pipeline.
-        Calls progress_callback(dict) on progress increments.
-        Raises FotaInterruptedError on Ctrl-C / cancel and FotaTransferError on a failed write.
+        Runs the update. Calls progress_callback(dict) as each step advances.
+        Raises FotaInterruptedError on Ctrl-C and FotaTransferError if a step fails before commit;
+        either way nothing has been installed.
         """
         pre = self.preflight_check()
-        start_time = time.time()
-        bytes_sent = 0
-        chunks_sent = 0
-        relay = pre["relay_via_dongle"]
+        start = time.time()
+        if self.dry_run:
+            return self._simulate(progress_callback, start)
 
+        transport = self._live_transport()
+        self._snapshot_settings()
         try:
-            for chunk_idx in range(self.total_chunks):
-                if self.cancelled:
-                    raise KeyboardInterrupt
+            transport.claim_exclusive()
+        except DeviceBusyError as e:
+            raise FotaSafetyError(str(e))
+        transport.auto_reconnect = False
 
-                start_byte = chunk_idx * self.chunk_size
-                end_byte = min(self.total_bytes, start_byte + self.chunk_size)
-                chunk_data = self.package.raw_data[start_byte:end_byte]
+        committed = False
+        base = self.fota_partition["address"]
+        try:
+            with self._target_route() as t:
+                # 1. Open the update session
+                self.phase = "start"
+                self._open_session(t)
 
-                if not self.dry_run:
-                    # Live hardware write via Report 0x06 (cbreak / FOTA block transmission)
-                    fota_packet = bytes([0x15, 0x5A]) + struct.pack("<HH", len(chunk_data) + 2, 0x1C03) + chunk_data
-                    self.client.transport.write_race_packet(fota_packet, is_dongle=relay, reconnect=False)
-                else:
-                    # In dry_run/simulation: smooth progression
-                    time.sleep(0.001)
+                # 2. Erase exactly the staging partition the device reported
+                self.phase = "erase"
+                self._report(progress_callback, 0, 1, start)
+                self._command(t, build_partition_erase(base, self.fota_partition["length"]), FOTA_ERASE_TIMEOUT_SEC)
+                self._report(progress_callback, 1, 1, start)
 
-                chunks_sent += 1
-                bytes_sent += len(chunk_data)
-                elapsed = max(0.001, time.time() - start_time)
-                speed_kb = (bytes_sent / 1024.0) / elapsed
-                remaining_bytes = self.total_bytes - bytes_sent
-                eta_sec = (remaining_bytes / 1024.0) / speed_kb if speed_kb > 0 else 0.0
+                # 3. Write the package
+                self.phase = "write"
+                phase_start = time.time()
+                step = self.pages_per_write * PAGE_SIZE
+                for offset in range(0, len(self.image), step):
+                    if self.cancelled:
+                        raise KeyboardInterrupt
+                    chunk = self.image[offset:offset + step]
+                    self._write_pages(t, base + offset, chunk)
+                    self.pages_written += len(chunk) // PAGE_SIZE
+                    self._report(progress_callback, self.pages_written, self.total_pages, phase_start)
 
-                if progress_callback and (chunk_idx % 10 == 0 or bytes_sent == self.total_bytes):
-                    pct = int((bytes_sent / float(self.total_bytes)) * 100)
-                    progress_callback({
-                        "bytes_sent": bytes_sent,
-                        "total_bytes": self.total_bytes,
-                        "percent": pct,
-                        "current_chunk": chunk_idx + 1,
-                        "total_chunks": self.total_chunks,
-                        "elapsed_sec": round(elapsed, 1),
-                        "speed_kb_s": round(speed_kb, 1),
-                        "eta_sec": round(eta_sec, 1),
-                        "done": bytes_sent >= self.total_bytes,
-                    })
+                # 4. Read every page back: the device's own check comes next, this one is independent of it
+                self.phase = "verify"
+                phase_start = time.time()
+                for offset in range(0, len(self.image), PAGE_SIZE):
+                    if self.cancelled:
+                        raise KeyboardInterrupt
+                    if self._read_page(t, base + offset) != self.image[offset:offset + PAGE_SIZE]:
+                        raise ProtocolError(f"Read-back mismatch at 0x{base + offset:08X}: the staged image is not what was sent")
+                    self.pages_verified += 1
+                    self._report(progress_callback, self.pages_verified, self.total_pages, phase_start)
+
+                # 5. Device-side integrity check of the staged package. The read-back has left the
+                #    session idle for over a minute, long enough for the device to end it, so restart it.
+                self.phase = "integrity"
+                self._open_session(t)
+                self._command(t, build_integrity_check(), FOTA_INTEGRITY_TIMEOUT_SEC)
+
+                if self.stage_only:
+                    return self._result(pre, start, "staged (not committed)", None, staged=True)
+
+                # 6. Commit: the device reboots and its bootloader installs the staged image
+                self.phase = "commit"
+                self._command(t, build_write_state(FOTA_STATE_DOWNLOADED))
+                committed = True
+                try:
+                    self._command(t, build_commit())
+                except ProtocolError as e:
+                    committed = False
+                    raise ProtocolError(f"Device refused the commit ({e})")
+                except (TimeoutError, OSError):
+                    self.reboot_seen = True  # the device may reboot before its reply gets out
         except KeyboardInterrupt:
             self.cancelled = True
-            if self.dry_run or chunks_sent == 0:
+            if committed:
                 raise FotaInterruptedError(
-                    f"FOTA flash cancelled after {chunks_sent} of {self.total_chunks} chunks"
-                    + (" (dry run, nothing was written)." if self.dry_run else " (nothing was written)."),
-                    chunks_sent, self.total_chunks,
+                    "Cancelled after the commit was sent: the device is installing the update. Do NOT unplug or "
+                    "power it off; wait for it to come back and run 'firmware status'.",
+                    self.pages_written, self.total_pages,
                 )
-            raise FotaInterruptedError(
-                self._transfer_stopped_message("FOTA flash cancelled", chunks_sent), chunks_sent, self.total_chunks
-            )
-        except (OSError, RuntimeError) as e:
-            raise FotaTransferError(
-                self._transfer_stopped_message(f"Write failed ({e})", chunks_sent), chunks_sent, self.total_chunks
-            )
+            raise FotaInterruptedError(self._stopped_message("Cancelled"), self.pages_written, self.total_pages)
+        except (ProtocolError, TimeoutError, OSError, RuntimeError) as e:
+            if committed:
+                raise FotaTransferError(
+                    f"Lost contact after the commit ({e}). The device is probably installing the update: do NOT "
+                    "unplug or power it off. Wait a few minutes, then run 'firmware status'.",
+                    self.pages_written, self.total_pages,
+                )
+            raise FotaTransferError(self._stopped_message(f"Stopped ({e})"), self.pages_written, self.total_pages)
+        finally:
+            transport.auto_reconnect = True
+            try:
+                transport.release_exclusive()
+            except Exception:
+                pass  # after commit the device has rebooted and this descriptor is gone
 
-        duration = time.time() - start_time
-        result = {
-            "success": True,
+        # 7. Wait for the device to come back and report the new version
+        self.phase = "install"
+        verification = self._verify_installed_version(progress_callback, reboot_seen=self.reboot_seen)
+        if verification["verification"] == "confirmed":
+            self.phase = "restore"
+            self.eq_restore = self._restore_custom_eq()
+        return self._result(pre, start, verification["verification"], verification["reported_version"])
+
+    def _result(self, pre: Dict[str, Any], start: float, verification: str, reported: Optional[str],
+                staged: bool = False) -> Dict[str, Any]:
+        return {
+            "success": staged or verification == "confirmed",
             "target": self.target,
             "version": self.package.version_string,
             "previous_version": pre["installed_version"],
             "total_bytes": self.total_bytes,
-            "chunks_sent": chunks_sent,
-            "duration_sec": round(duration, 2),
-            "dry_run": self.dry_run,
-            "verification": "skipped (dry run)",
-            "reported_version": None,
+            "total_pages": self.total_pages,
+            "chunks_sent": self.pages_written,
+            "pages_verified": self.pages_verified,
+            "fota_partition": self.fota_partition,
+            "duration_sec": round(time.time() - start, 2),
+            "dry_run": False,
+            "staged_only": staged,
+            "verification": verification,
+            "reported_version": reported,
+            "backup_file": self.backup_file,
+            "eq_restored": (self.eq_restore or {}).get("restored", []),
+            "eq_restore_errors": (self.eq_restore or {}).get("errors", []),
         }
-        if not self.dry_run:
-            result.update(self._verify_installed_version())
-            result["success"] = result["verification"] == "confirmed"
-        return result
+
+    def _staging_consumed(self) -> Optional[bool]:
+        """
+        Whether the bootloader has taken the staged package: after an install it clears the staging
+        area, while an uncommitted package stays there across reboots (both seen on a Maxwell 2
+        headset and dongle). True / False, or None if the staging area can't be read right now.
+        """
+        transport = getattr(self.client, "transport", None)
+        if transport is None or not self.fota_partition:
+            return None
+        if self.target == "dongle":
+            if getattr(transport, "is_dongle", None) is not True:
+                return None  # only a dongle node can reach the dongle's flash
+            route = False
+        else:
+            # The headset's flash: relayed through a dongle node, direct on the headset's USB node
+            route = bool(getattr(transport, "node_is_dongle", None) if getattr(transport, "node_is_dongle", None)
+                         is not None else transport.is_dongle)
+        address = self.fota_partition["address"]
+        try:
+            resp = transport.exchange(build_page_read(address), timeout_sec=FOTA_PAGE_TIMEOUT_SEC, is_dongle=route)
+            return parse_page_read(resp, address) != self.image[:PAGE_SIZE]
+        except Exception:
+            return None
+
+    def _verify_installed_version(self, progress_callback=None, reboot_seen: bool = False) -> Dict[str, Any]:
+        """
+        Polls the target's version until it reports the package version or the timeout expires.
+        If the package version equals the one installed before, a matching version proves nothing
+        on its own (the old firmware reports it too, if the device hasn't rebooted yet), so the
+        device must also have been seen going away: a failed or empty read, or a reconnect.
+        """
+        expected = parse_version_tuple(self.package.version_string)
+        same_version = bool(self.installed_version) and parse_version_tuple(self.installed_version) == expected
+        transport = getattr(self.client, "transport", None)
+        reconnects_before = getattr(transport, "reconnect_count", 0)
+        start = time.time()
+        deadline = start + self.readback_timeout_sec
+        last_seen = "Unknown"
+        staged_still = False
+        while True:
+            staged_still = False
+            try:
+                last_seen = self._read_target_version()
+            except Exception:
+                last_seen = "Unknown"  # expected while the device reboots into the new image
+            if last_seen == "Unknown" or getattr(transport, "reconnect_count", 0) != reconnects_before:
+                reboot_seen = True
+            matches = last_seen != "Unknown" and parse_version_tuple(last_seen) == expected
+            if matches:
+                consumed = self._staging_consumed()
+                if consumed is None:
+                    # Can't read the staging area: fall back to version (and reboot, for a same-version update)
+                    if reboot_seen or not same_version:
+                        return {"verification": "confirmed", "reported_version": last_seen}
+                elif consumed:
+                    return {"verification": "confirmed", "reported_version": last_seen}
+                else:
+                    staged_still = True  # answering, but the bootloader hasn't installed the package yet
+            if progress_callback:
+                elapsed = time.time() - start
+                progress_callback({
+                    "phase": "install", "done": int(elapsed), "total": int(self.readback_timeout_sec),
+                    "percent": min(100, int(elapsed * 100 / self.readback_timeout_sec)) if self.readback_timeout_sec else 100,
+                    "current_chunk": 0, "total_chunks": 0, "elapsed_sec": round(elapsed, 1),
+                    "speed_kb_s": 0.0, "eta_sec": 0.0, "done_all": False, "reported_version": last_seen,
+                })
+            if time.time() >= deadline:
+                break
+            time.sleep(self.readback_interval_sec)
+        if last_seen == "Unknown":
+            status = "no_response"
+        elif parse_version_tuple(last_seen) == expected and staged_still:
+            status = "still_staged"    # the package is still in the staging area: not installed
+        elif parse_version_tuple(last_seen) == expected:
+            status = "no_reboot_seen"  # same version, and the device never went away: install not proven
+        else:
+            status = "version_mismatch"
+        return {"verification": status, "reported_version": last_seen}
 
 
 # ==============================================================================
@@ -906,28 +1383,38 @@ def format_firmware_status_plain(diag: Dict[str, Any]) -> str:
     p_str = "MATCHED (Synchronized)" if parity else "MISMATCH WARNING"
     lines.append(f"│  Version Parity Check      : {p_str:<38} │")
 
+    def row(text: str) -> str:
+        return "│" + text[:70].ljust(70) + "│"
+
     batt = diag.get("battery_percent")
     batt_str = f"{batt}%" if batt is not None else "Unknown"
     batt_safe = diag.get("battery_safe_for_flashing", False)
-    safe_badge = "(Pass >= 50%)" if batt_safe else "(LOW - Flashing Unsafe)"
-    lines.append(f"│  Headset Battery Level     : {batt_str:<8} {safe_badge:<29} │")
+    needed = diag.get("battery_required_percent", MIN_HEADSET_BATTERY_PCT)
+    charging = needed > MIN_HEADSET_BATTERY_PCT
+    safe_badge = (f"(Pass >= {needed}%" + (", charging)" if charging else ")")) if batt_safe else \
+        (f"(LOW: {needed}% needed" + (" on charger)" if charging else ")"))
+    lines.append(row(f"  Headset Battery Level     : {batt_str:<8} {safe_badge}"))
 
     conn = diag.get("connection_mode", "Unknown")
     lines.append(f"│  Active Transport Path     : {conn:<38} │")
 
     lines.append("│                                                                      │")
-    lines.append("├─ DUAL-BANK FLASH SAFETY READINESS ───────────────────────────────────┤")
+    lines.append("├─ UPDATE SAFETY READINESS ────────────────────────────────────────────┤")
 
     ready = diag.get("update_prerequisites_met", False)
     if ready:
         lines.append("│  [PASS] All pre-flight safety requirements satisfied for updates:     │")
         lines.append("│         ✔ Dongle and Headset firmware versions match.                │")
-        lines.append("│         ✔ Headset battery has sufficient capacity (>= 50%).          │")
-        lines.append("│         ✔ Airoha dual-bank fallback protects against bricking.        │")
+        lines.append(row(f"         ✔ Headset battery has sufficient capacity (>= {needed}%)."))
+        lines.append("│         ✔ Updates are staged: nothing installs before the commit.     │")
     else:
         lines.append("│  [CAUTION] Pre-flight prerequisites not fully satisfied:             │")
         if not batt_safe:
-            lines.append("│         ✖ Battery is below 50%. Charge headset before flashing.      │")
+            if charging:
+                lines.append(row(f"         ✖ Below {needed}% while charging (readings on the charger run"))
+                lines.append(row("           high). Let it charge further before flashing."))
+            else:
+                lines.append(row(f"         ✖ Battery is below {needed}%. Charge headset before flashing."))
         if not parity:
             lines.append("│         ✖ Firmware mismatch detected between dongle and headset.     │")
 
