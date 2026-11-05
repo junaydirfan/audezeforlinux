@@ -28,7 +28,7 @@
 
 ---
 
-**Audeze for Linux** (`audezeforlinux`) gives Linux gamers, audiophiles, and sound engineers native hardware-level control over their **Audeze Maxwell 2** and **Maxwell 1** headsets. Built with zero external dependencies in pure Python, it operates out-of-the-box on **Arch Linux, CachyOS, Fedora, Ubuntu, Debian, openSUSE, and Steam Deck**.
+**Audeze for Linux** (`audezeforlinux`) gives Linux gamers, audiophiles, and sound engineers native hardware-level control over their **Audeze Maxwell 2** headsets, with the original **Maxwell** expected to work through the same protocol (not yet confirmed on Linux by us). Built with zero external dependencies in pure Python, it operates out-of-the-box on **Arch Linux, CachyOS, Fedora, Ubuntu, Debian, openSUSE, and Steam Deck**.
 
 No proprietary Windows or macOS companion apps required. Configure custom 10-band graphic EQ curves, switch factory presets, fine-tune sidetone and Game/Chat balance, inspect firmware releases, and verify hardware safety directly from a high-performance terminal UI or command line.
 
@@ -115,16 +115,54 @@ audezeforlinux dashboard
 
 | Headset / Dongle Model | USB VID:PID | Connection Interface | Status |
 | :--------------------- | :---------: | :------------------: | :----: |
-| **Maxwell 2 (Xbox Dongle)** | `3329:4B28` | Wireless 2.4 GHz Dongle | **Verified & Tested (Active)** |
-| **Maxwell 2 (PlayStation / PC Dongle)** | `3329:4B29` | Wireless 2.4 GHz Dongle | Supported |
-| **Maxwell 2 (Direct USB-C)** | `3329:4B2A` | Direct USB Audio / HID | Supported |
+| **Maxwell 2 (Xbox Dongle)** | `3329:4B28` | Wireless 2.4 GHz Dongle | **Verified on hardware** (controls, battery, firmware update) |
+| **Maxwell 2 (Xbox USB-C)** | `3329:4B2E` | Direct USB Audio / HID | **Verified on hardware** (controls, battery, firmware update) |
+| **Maxwell 2 (PlayStation / PC Dongle)** | `3329:4B29` | Wireless 2.4 GHz Dongle | Same protocol; works for [HeadsetControl](https://github.com/Sapd/HeadsetControl) users, not yet confirmed here |
+| **Maxwell 2 (PlayStation USB-C)** | `3329:4B2A` | Direct USB Audio / HID | Expected to work (product ID inferred) |
 | **Maxwell 2 ANC (Xbox Dongle)** | `3329:4BA8` | Wireless 2.4 GHz Dongle | Detected (ID from [#3](https://github.com/junaydirfan/audezeforlinux/issues/3)); controls untested |
 | **Maxwell 2 ANC (PlayStation Dongle)** | `3329:4BA9` | Wireless 2.4 GHz Dongle | Detected (ID from [#4](https://github.com/junaydirfan/audezeforlinux/issues/4); ANC inferred from the ID, not yet confirmed); controls untested |
 | **Maxwell 2 ANC (Direct USB-C)** | Unknown | — | Device IDs needed ([open an issue](https://github.com/junaydirfan/audezeforlinux/issues) with your `lsusb` output) |
-| **Maxwell 1 (Xbox Dongle)** | `3329:4B18` | Wireless 2.4 GHz Dongle | Supported |
-| **Maxwell 1 (PlayStation Dongle)** | `3329:4B19` | Wireless 2.4 GHz Dongle | Supported |
-| **Maxwell 1 (PlayStation USB-C)** | `3329:4B1A` | Direct USB Audio / HID | Supported |
-| **Maxwell 1 (Xbox USB-C)** | `3329:4B1E` | Direct USB Audio / HID | Supported |
+| **Maxwell 1 (Xbox Dongle)** | `3329:4B18` | Wireless 2.4 GHz Dongle | Expected to work: same protocol as the Maxwell 2 (HeadsetControl supports it); **not yet confirmed here, please report** |
+| **Maxwell 1 (PlayStation Dongle)** | `3329:4B19` | Wireless 2.4 GHz Dongle | Expected to work, as above; please report |
+| **Maxwell 1 (PlayStation USB-C)** | `3329:4B1A` | Direct USB Audio / HID | Expected to work, as above; please report |
+| **Maxwell 1 (Xbox USB-C)** | `3329:4B1E` | Direct USB Audio / HID | Expected to work, as above; please report |
+
+Firmware updates are verified only on the Maxwell 2 (Xbox) and need `--experimental`; Maxwell 1 packages are refused.
+
+---
+
+## Troubleshooting
+
+### Nothing is read / everything shows "Unknown"
+
+Run the doctor first. It sends a few **read-only** queries to the dongle and the headset and says which part isn't answering:
+
+```bash
+audezeforlinux doctor
+```
+
+| Doctor says | What it means | Fix |
+| :---------- | :------------ | :-- |
+| *Nothing answers, not even the dongle itself* | The dongle is stuck. Maxwell dongles (original and Maxwell 2) can get into a state where they keep playing audio and even apply setting changes, but answer every query with an empty report, until they're replugged. Also seen by HeadsetControl users ([#460](https://github.com/Sapd/HeadsetControl/issues/460), [#573](https://github.com/Sapd/HeadsetControl/issues/573)) | Unplug the dongle, wait 5 seconds, plug it back in (straight into the PC if you use the short USB-C extension) |
+| *The dongle answers, but the headset doesn't* | The headset is off, asleep, or not linked to the dongle | Switch it on; re-pair it if it stays silent |
+| *Permission denied* | No udev rule for your user | `audezeforlinux setup-udev`, then replug the device |
+| *Other programs have this device open* | Another tool (HeadsetControl, a battery widget, Audeze HQ under Wine...) is polling the dongle and can take the replies | Close it and retry |
+
+### Bazzite, Silverblue, SteamOS and other immutable systems
+
+`/etc/udev/rules.d` is writable on these systems, so `setup-udev` works when run **on the host**. If you run audezeforlinux inside **distrobox** or **toolbox**, the rule it installs lands in the container and the host never sees it. `doctor` tells you when it's running inside a container. Install the rule on the host instead:
+
+```bash
+# on the host, from the repository folder
+sudo cp udev/70-audeze-maxwell.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules && sudo udevadm trigger
+```
+
+Then replug the dongle. audezeforlinux itself has no dependencies beyond Python 3.8+, so it can run directly on the host.
+
+### Reporting a problem
+
+Please include the output of `audezeforlinux --json doctor` and `lsusb | grep 3329` in your [issue](https://github.com/junaydirfan/audezeforlinux/issues). The doctor output contains device IDs, the replies to its queries and the names of programs that have the device open; nothing else.
 
 ---
 

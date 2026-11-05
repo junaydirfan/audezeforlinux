@@ -37,7 +37,7 @@ from maxwell2.protocol import (
     PRESET_NAMES,
     ProtocolError,
 )
-from maxwell2.transport import Transport, list_maxwell_devices
+from maxwell2.transport import PID_MODELS, Transport, list_maxwell_devices
 from maxwell2.backup import create_backup, load_backup
 
 COEFFICIENT_READ_ATTEMPTS = 6
@@ -45,6 +45,11 @@ BATTERY_READ_ATTEMPTS = 2
 
 BATTERY_CHARGING = "charging"
 BATTERY_CHARGED = "charged"
+
+
+def model_name(product_id: Optional[int]) -> str:
+    """Connected model for display, e.g. 'Maxwell 1 (PlayStation Dongle)'; 'Audeze Maxwell' if unknown."""
+    return PID_MODELS.get(product_id, "Audeze Maxwell") if product_id is not None else "Audeze Maxwell"
 
 
 def battery_state(percent: Optional[int], usb_powered: bool) -> Optional[str]:
@@ -222,12 +227,14 @@ class MaxwellClient:
         """Collects full status information in one dictionary with per-field resilience."""
         status = {}
         responded = False
+        unreadable = []  # fields below that hold placeholders, not readings
 
         try:
             status["preset"] = self.get_preset()
             responded = True
         except Exception:
             status["preset"] = {"index": 4, "name": "Immersive", "is_custom": False, "slot": None}
+            unreadable.append("preset")
 
         try:
             status.update(self.get_power())
@@ -235,40 +242,51 @@ class MaxwellClient:
         except Exception:
             # Never a made-up level: an unknown battery reads as unknown
             status.update({"battery_percent": None, "usb_powered": False, "battery_state": None})
+            unreadable.append("battery")
 
         try:
             status["firmware"] = self.get_firmware()
             responded = responded or status["firmware"]["firmware"] != "Unknown"
         except Exception:
-            status["firmware"] = {"firmware": "v1.0.5.7.4", "dongle": "v1.0.5.7.4", "headset": "v1.0.5.7.4", "match": True}
+            status["firmware"] = {"firmware": "Unknown", "dongle": "Unknown", "headset": "Unknown", "match": True}
+        if status["firmware"].get("firmware") == "Unknown":
+            unreadable.append("firmware")
 
         try:
             status["mic_muted"] = self.get_mic_mute()
             responded = True
         except Exception:
-            status["mic_muted"] = False
+            status["mic_muted"] = None
+            unreadable.append("mic_muted")
 
         try:
             status["sidetone"] = self.get_sidetone()
             responded = True
         except Exception:
             status["sidetone"] = {"enabled": False, "level": 5, "max_level": 31}
+            unreadable.append("sidetone")
 
         try:
             status["chat_mix"] = self.get_chat_mix()
             responded = True
         except Exception:
             status["chat_mix"] = {"raw": 10, "game_pct": 50, "chat_pct": 50}
+            unreadable.append("chat_mix")
 
         try:
             status["noise_reduction"] = self.get_noise_reduction()
             responded = True
         except Exception:
             status["noise_reduction"] = {"code": 1, "name": "Low"}
+            unreadable.append("noise_reduction")
 
-        # Every field above falls back to a placeholder, so callers need this to
-        # tell real readings from defaults.
+        if status.get("battery_percent") is None and "battery" not in unreadable:
+            unreadable.append("battery")
+        # Fields that failed keep a placeholder (the dashboard's controls need a value), so callers
+        # must check these before showing a field as a reading.
         status["device_responding"] = responded
+        status["unreadable"] = unreadable
+        status["model"] = model_name(getattr(self.transport, "product_id", None))
         return status
 
     # --------------------------------------------------------------------------

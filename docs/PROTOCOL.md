@@ -10,7 +10,8 @@ This document details the communication protocol between host software and the A
 ## 1. Transport Layer: USB HID Framing
 
 ### 1.1 Interface & Endpoints [CONFIRMED]
-- **Interface**: Interface 5 (HID Class).
+- **Interface**: the HID interface whose report descriptor declares the vendor collection **usage page `0xFF13`** (usage 1, report IDs `0x06` / `0x07`). Its interface number isn't fixed: interface 5 on the Maxwell 2 dongle with the headset on, interface 0 on the same dongle with the headset off (it re-enumerates with fewer audio interfaces), interface 0 on the Maxwell 2 headset over USB-C, and interface 0 on the original Maxwell dongle (per HeadsetControl). So the transport selects nodes by usage page (from `/sys/class/hidraw/*/device/report_descriptor`), not by interface number.
+- **Stuck dongle** [OBSERVED in the field, both generations]: a dongle can keep enumerating, playing audio and applying writes while answering every query with an empty (`len 0`) input report, until it is replugged (HeadsetControl issues #460, #573). `audezeforlinux doctor` detects this: the dongle doesn't even answer a query addressed to itself (route `0x00`), which a dongle with its headset switched off still does.
 - **Driver**: Linux `usbhid` / `hidraw`.
 - **Interrupt IN Endpoint**: `0x82` (EP 2 IN), 64-byte max packet size, 1ms polling interval.
 - **Output Transfer**: HID Output Reports via Interrupt OUT or Control Endpoint (SET_REPORT).
