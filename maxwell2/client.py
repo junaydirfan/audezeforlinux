@@ -134,20 +134,18 @@ class MaxwellClient:
 
         packet = build_firmware_command()
 
-        # 1. Query Dongle firmware (route 0x00)
+        # 1. Query Dongle firmware (route 0x00). The route is overridden for this request only:
+        #    setting and restoring transport.is_dongle around it would undo the route a reconnect
+        #    re-detects in between (headset unplugged from USB-C, now reached via the dongle).
         fw_dongle = "Unknown"
-        old_dongle_flag = self.transport.is_dongle
         try:
-            self.transport.is_dongle = False  # Route 0x00
-            notif = self.transport.query_notification(packet, timeout_sec=1.2)
+            notif = self.transport.query_notification(packet, timeout_sec=1.2, is_dongle=False)
             if notif:
                 fw_dongle = parse_firmware_notification(notif)
         except Exception:
             pass
-        finally:
-            self.transport.is_dongle = old_dongle_flag
 
-        # 2. Query Headset firmware (route 0x80)
+        # 2. Query Headset firmware (the node's own route: 0x80 relay through a dongle, 0x00 over USB-C)
         fw_headset = "Unknown"
         try:
             notif = self.transport.query_notification(packet, timeout_sec=1.2)
