@@ -246,10 +246,7 @@ To maintain production stability and security, `audezeforlinux` incorporates con
 1. **GitHub CodeQL (Static Analysis & Vulnerability Scanning)**:
    - Evaluated weekly and on every pull request via [.github/workflows/codeql.yml](.github/workflows/codeql.yml).
    - Scans Python code against OWASP vulnerabilities, CWE security risks, and unsafe buffer operations.
-2. **SonarCloud / SonarQube Quality Gate**:
-   - Analyzes cognitive complexity, code duplication, and maintainability ratings.
-   - To link your SonarCloud project, add your `SONAR_TOKEN` to your GitHub repository secrets and enable the SonarCloud GitHub app.
-3. **Ruff & Python Typing**:
+2. **Ruff & Python Typing**:
    - Zero-dependency architecture strictly validated across Python 3.8, 3.9, 3.10, 3.11, 3.12, and 3.13 via [.github/workflows/ci.yml](.github/workflows/ci.yml).
 
 ---
