@@ -4,6 +4,7 @@ Implements status queries, control adjustments, EQ profile management,
 and pre-write backup snapshots.
 """
 
+import copy
 import time
 from typing import Dict, Any, Optional, Union, List
 from maxwell2.protocol import (
@@ -37,14 +38,44 @@ from maxwell2.protocol import (
     PRESET_NAMES,
     ProtocolError,
 )
-from maxwell2.transport import PID_MODELS, Transport, list_maxwell_devices
+from maxwell2.transport import (
+    PID_MODELS,
+    DeviceBusyError,
+    DeviceNotFoundError,
+    DevicePermissionError,
+    Transport,
+    list_maxwell_devices,
+)
 from maxwell2.backup import create_backup, load_backup
+from maxwell2.events import record_event
 
 COEFFICIENT_READ_ATTEMPTS = 6
 BATTERY_READ_ATTEMPTS = 2
 
 BATTERY_CHARGING = "charging"
 BATTERY_CHARGED = "charged"
+
+# What check_link() finds when the headset doesn't answer
+LINK_OK = "ok"
+LINK_HEADSET_SILENT = "headset_silent"  # the dongle answers, the headset doesn't: off, asleep or unlinked
+LINK_DONGLE_SILENT = "dongle_silent"    # not even the dongle answers: it's stuck until reset or replugged
+LINK_USB_SILENT = "usb_silent"          # the headset's own USB-C node doesn't answer
+
+# After a reset the dongle re-links with the headset; give it a few checks to do so
+RELINK_CHECKS = 3
+RELINK_INTERVAL_SEC = 1.5
+
+STATUS_FIELDS = ("preset", "battery", "firmware", "mic_muted", "sidetone", "chat_mix", "noise_reduction")
+# Values get_status() stores for fields that didn't answer (the dashboard's controls need one); such
+# fields are always listed in "unreadable" and never shown as readings.
+STATUS_PLACEHOLDERS: Dict[str, Any] = {
+    "preset": {"index": 4, "name": "Immersive", "is_custom": False, "slot": None},
+    "firmware": {"firmware": "Unknown", "dongle": "Unknown", "headset": "Unknown", "match": True},
+    "mic_muted": None,
+    "sidetone": {"enabled": False, "level": 5, "max_level": 31},
+    "chat_mix": {"raw": 10, "game_pct": 50, "chat_pct": 50},
+    "noise_reduction": {"code": 1, "name": "Low"},
+}
 
 
 def model_name(product_id: Optional[int]) -> str:
@@ -80,6 +111,74 @@ class MaxwellClient:
 
     def __init__(self, transport: Transport):
         self.transport = transport
+        # One automatic reset per stuck episode: re-armed once the headset is seen answering, so a
+        # dongle that a reset doesn't fix isn't reset (dropping audio) over and over
+        self.auto_reset_armed = True
+
+    # --------------------------------------------------------------------------
+    # Connection checks & stuck-dongle recovery
+    # --------------------------------------------------------------------------
+
+    def _node_is_dongle(self) -> bool:
+        kind = getattr(self.transport, "node_is_dongle", None)
+        return bool(self.transport.is_dongle if kind is None else kind)
+
+    def check_link(self) -> str:
+        """
+        Works out which part isn't answering (one of the LINK_* values). Read-only: asks the
+        opened node for its firmware version, then, through a dongle, the headset for its battery.
+        """
+        if self.transport.dry_run:
+            return LINK_OK
+        dongle = self._node_is_dongle()
+        if not self.transport.node_answers(build_firmware_command()):
+            return LINK_DONGLE_SILENT if dongle else LINK_USB_SILENT
+        if dongle and self.get_battery(attempts=1, timeout_sec=1.2) is None:
+            return LINK_HEADSET_SILENT
+        self.auto_reset_armed = True
+        return LINK_OK
+
+    def recover_stuck_dongle(self, force: bool = False) -> Dict[str, Any]:
+        """
+        Checks the link and, if the dongle itself has stopped answering, resets it over USB (what a
+        replug does) and checks again. Without force this happens once per stuck episode: not again
+        until the headset has answered in between. force (the reset-dongle command) also resets a
+        dongle whose headset is silent. Returns:
+          link        what check_link() found first
+          action      "none" (nothing to fix), "reset", "already_tried", "no_permission" or "failed"
+          link_after  check_link() after the reset (only when reset)
+          recovered   True if the headset answers now
+          detail      error text for no_permission / failed
+        """
+        link = self.check_link()
+        result: Dict[str, Any] = {"link": link, "action": "none", "recovered": link == LINK_OK, "detail": ""}
+        if link != LINK_DONGLE_SILENT and not (force and link != LINK_OK and self._node_is_dongle()):
+            return result
+        if not force and not self.auto_reset_armed:
+            result["action"] = "already_tried"
+            return result
+
+        self.auto_reset_armed = False
+        try:
+            self.transport.reset_usb_device()
+        except DevicePermissionError as e:
+            result.update(action="no_permission", detail=str(e))
+        except (DeviceNotFoundError, DeviceBusyError, OSError) as e:
+            result.update(action="failed", detail=str(e))
+        else:
+            result["action"] = "reset"
+            after = self.check_link()
+            for _ in range(RELINK_CHECKS - 1):
+                if after != LINK_HEADSET_SILENT:
+                    break  # answering, or still stuck: waiting longer won't change that
+                time.sleep(RELINK_INTERVAL_SEC)
+                after = self.check_link()
+            result["link_after"] = after
+            result["recovered"] = after == LINK_OK
+        record_event("dongle_silent" if link == LINK_DONGLE_SILENT else link, action=result["action"],
+                     recovered=result["recovered"], link_after=result.get("link_after"),
+                     detail=result["detail"] or None, forced=force or None)
+        return result
 
     # --------------------------------------------------------------------------
     # Telemetry & Status Reads
@@ -223,9 +322,34 @@ class MaxwellClient:
         names = {0: "Off", 1: "Low", 2: "High"}
         return {"code": code, "name": names.get(code, f"Unknown ({code})")}
 
-    def get_status(self) -> Dict[str, Any]:
-        """Collects full status information in one dictionary with per-field resilience."""
-        status = {}
+    def _silent_status(self, link: str, recovery: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """Status for a headset that can't answer anything: every field a placeholder, flagged unreadable."""
+        status = copy.deepcopy(STATUS_PLACEHOLDERS)
+        try:
+            usb_powered = self.is_usb_powered()
+        except Exception:
+            usb_powered = False
+        status.update({
+            "battery_percent": None,
+            "usb_powered": usb_powered,
+            "battery_state": None,
+            "device_responding": False,
+            "unreadable": list(STATUS_FIELDS),
+            "link": link,
+            "recovery": recovery,
+            "model": model_name(getattr(self.transport, "product_id", None)),
+        })
+        return status
+
+    def get_status(self, recover: bool = True) -> Dict[str, Any]:
+        """
+        Collects full status information in one dictionary with per-field resilience.
+        If the first read gets no reply, the link is checked straight away: when nothing can answer
+        (headset off, or the dongle stuck) the remaining reads are skipped instead of each waiting
+        out its timeout, and with recover a stuck dongle is reset first (see recover_stuck_dongle).
+        The result's "link" and "recovery" keys say what was found and done.
+        """
+        status: Dict[str, Any] = {"link": LINK_OK, "recovery": None}
         responded = False
         unreadable = []  # fields below that hold placeholders, not readings
 
@@ -233,7 +357,25 @@ class MaxwellClient:
             status["preset"] = self.get_preset()
             responded = True
         except Exception:
-            status["preset"] = {"index": 4, "name": "Immersive", "is_custom": False, "slot": None}
+            status["preset"] = None
+        if status["preset"] is None and not self.transport.dry_run:
+            recovery = self.recover_stuck_dongle() if recover else None
+            link = recovery.get("link_after", recovery["link"]) if recovery else self.check_link()
+            status["link"], status["recovery"] = link, recovery
+            if link == LINK_OK:
+                try:
+                    status["preset"] = self.get_preset()
+                    responded = True
+                except Exception:
+                    pass
+            else:
+                # A reset attempt was already logged by recover_stuck_dongle; a dongle that is still
+                # stuck after one isn't logged on every retry
+                if link != LINK_DONGLE_SILENT and (recovery is None or recovery["action"] == "none"):
+                    record_event(link)
+                return self._silent_status(link, recovery)
+        if status["preset"] is None:
+            status["preset"] = copy.deepcopy(STATUS_PLACEHOLDERS["preset"])
             unreadable.append("preset")
 
         try:
@@ -285,6 +427,8 @@ class MaxwellClient:
         # Fields that failed keep a placeholder (the dashboard's controls need a value), so callers
         # must check these before showing a field as a reading.
         status["device_responding"] = responded
+        if responded:
+            self.auto_reset_armed = True  # this stuck episode is over
         status["unreadable"] = unreadable
         status["model"] = model_name(getattr(self.transport, "product_id", None))
         return status

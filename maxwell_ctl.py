@@ -11,8 +11,15 @@ import json
 import argparse
 from typing import Optional
 
-from maxwell2.transport import Transport, DeviceNotFoundError, DevicePermissionError
-from maxwell2.client import MaxwellClient, describe_battery
+from maxwell2.transport import Transport, DeviceNotFoundError, DevicePermissionError, list_maxwell_devices
+from maxwell2.client import (
+    MaxwellClient,
+    describe_battery,
+    LINK_OK,
+    LINK_DONGLE_SILENT,
+    LINK_HEADSET_SILENT,
+    LINK_USB_SILENT,
+)
 from maxwell2.protocol import PRESET_NAMES
 from maxwell2.backup import list_backups, load_backup
 
@@ -73,6 +80,48 @@ def format_plain_status(status: dict) -> str:
     lines.append(f"  AI Noise Reduction : {unknown if 'noise_reduction' in unread else nr}")
     lines.append("=" * 60)
     return "\n".join(lines)
+
+
+def silent_advice(status: dict) -> str:
+    """What to do when the headset didn't answer, from the link check and any reset already tried."""
+    link = status.get("link")
+    recovery = status.get("recovery") or {}
+    action = recovery.get("action")
+    head = "[!] No response from the headset: nothing below is a reading.\n    "
+    if link == LINK_DONGLE_SILENT:
+        if action == "reset":
+            return head + ("The dongle stopped answering and resetting it didn't help. Unplug it, wait 5 seconds\n"
+                           "    and plug it back in.")
+        if action == "no_permission":
+            return head + ("The dongle stopped answering (Maxwell dongles can get stuck until they're replugged).\n"
+                           "    Replug it, or run 'audezeforlinux setup-udev' once so the app can reset it for you.")
+        return head + "The dongle stopped answering: unplug it, wait 5 seconds and plug it back in."
+    if link == LINK_HEADSET_SILENT:
+        return head + ("The dongle answers, but the headset doesn't. Check that it is switched on and linked to\n"
+                       "    the dongle. If it is, run 'audezeforlinux reset-dongle' or replug the dongle.")
+    if link == LINK_USB_SILENT:
+        return head + "The headset's USB-C connection doesn't answer: replug the cable or try another port."
+    return head + ("Check that it is powered on and linked to the dongle. If it is, unplug the dongle,\n"
+                   "    wait 5 seconds and plug it back in: Maxwell dongles can get stuck answering\n"
+                   "    nothing until they're replugged. Run 'audezeforlinux doctor' for a full check.")
+
+
+def format_reset_result(res: dict) -> str:
+    """Outcome of 'reset-dongle' in plain words."""
+    action, link = res["action"], res.get("link_after", res["link"])
+    if action == "none":
+        if res["link"] == LINK_OK:
+            return "[+] The dongle and headset answer normally: no reset needed."
+        return "[-] Nothing to reset: this isn't a dongle."
+    if action == "no_permission":
+        return f"[-] {res['detail']}"
+    if action == "failed":
+        return f"[-] Reset failed: {res['detail']}"
+    if res["recovered"]:
+        return "[+] Dongle reset: the headset answers again."
+    if link == LINK_HEADSET_SILENT:
+        return "[!] Dongle reset and answering, but the headset doesn't: check that it is on and linked."
+    return "[-] The dongle still doesn't answer after the reset: unplug it, wait 5 seconds and plug it back in."
 
 
 def format_plain_eq(eq_data: dict) -> str:
@@ -187,6 +236,8 @@ def main():
     # 9. system utilities (doctor, setup-udev, install-system)
     subparsers.add_parser("doctor", help="Run comprehensive Linux audio environment and permissions diagnostics")
     subparsers.add_parser("setup-udev", help="Install /etc/udev/rules.d rules for non-root hardware access")
+    subparsers.add_parser("reset-dongle", help="Reset a dongle that stopped answering (like replugging it; audio "
+                                               "drops for a second)")
     subparsers.add_parser("install-system", help="Install desktop application entry and user PATH symlink to ~/.local/bin")
 
     args = parser.parse_args()
@@ -404,8 +455,16 @@ def main():
             return
 
     # Initialize transport and client
+    device = args.device
+    if args.command == "reset-dongle" and device is None:
+        # The headset's own USB-C node is preferred elsewhere; this command is about the dongle
+        dongles = [d for d in list_maxwell_devices() if d["is_dongle"]]
+        if not dongles:
+            print("[-] No Audeze dongle found.")
+            sys.exit(1)
+        device = dongles[0]["path"]
     try:
-        transport = Transport(hidraw_path=args.device, dry_run=args.dry_run)
+        transport = Transport(hidraw_path=device, dry_run=args.dry_run)
         with transport:
             client = MaxwellClient(transport)
 
@@ -414,14 +473,23 @@ def main():
                 run_interactive_dashboard(client)
                 return
 
+            if args.command == "reset-dongle":
+                res = client.recover_stuck_dongle(force=True)
+                if args.json:
+                    print(json.dumps(res, indent=2))
+                else:
+                    print(format_reset_result(res))
+                if not (res["recovered"] or res["action"] == "none" and res["link"] == LINK_OK):
+                    sys.exit(1)
+                return
+
             if args.command == "status":
                 status = client.get_status()
+                recovery = status.get("recovery") or {}
+                if recovery.get("action") == "reset" and recovery.get("recovered"):
+                    print("[+] The dongle had stopped answering, so it was reset (like a replug).", file=sys.stderr)
                 if not status["device_responding"]:
-                    print("[!] No response from the headset: nothing below is a reading.\n"
-                          "    Check that it is powered on and linked to the dongle. If it is, unplug the dongle,\n"
-                          "    wait 5 seconds and plug it back in: Maxwell dongles can get stuck answering\n"
-                          "    nothing until they're replugged. Run 'audezeforlinux doctor' for a full check.",
-                          file=sys.stderr)
+                    print(silent_advice(status), file=sys.stderr)
                 elif status.get("unreadable"):
                     print(f"[!] No reply for: {', '.join(status['unreadable'])} (shown as Unknown).", file=sys.stderr)
                 if args.json:

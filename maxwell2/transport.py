@@ -44,6 +44,12 @@ def _HIDIOCGINPUT(length: int) -> int:
     return (IOC_READ_WRITE << 30) | (length << 16) | (IOC_TYPE_H << 8) | 0x0A
 
 
+# usbdevfs USBDEVFS_RESET = _IO('U', 20): a USB port reset, as the host does when a device is plugged in.
+USBDEVFS_RESET = (ord("U") << 8) | 20
+# How long a reset dongle gets to show up again before giving up
+RESET_SETTLE_SEC = 10.0
+
+
 # Errors a write gets once the hidraw node has gone away. The headset and dongle both
 # re-enumerate (with new /dev/hidrawN numbers) when the headset is switched on or off.
 DEVICE_GONE_ERRNOS = (errno.ENODEV, errno.EIO, errno.EBADF, errno.ENOENT, errno.EPIPE, errno.ESHUTDOWN)
@@ -171,6 +177,25 @@ def list_maxwell_devices(include_all: bool = False) -> List[dict]:
         except Exception:
             continue
     return found
+
+
+def usb_device_node(hidraw_path: str, sys_root: str = "/sys") -> Optional[str]:
+    """
+    The /dev/bus/usb/BBB/DDD node of the USB device that a hidraw node belongs to, or None.
+    Found by walking up from the HID device in sysfs to the first directory with busnum/devnum.
+    """
+    hid_dir = os.path.realpath(os.path.join(sys_root, "class", "hidraw", os.path.basename(hidraw_path), "device"))
+    d = hid_dir
+    while d and d != os.path.dirname(d):
+        try:
+            with open(os.path.join(d, "busnum")) as f:
+                bus = int(f.read())
+            with open(os.path.join(d, "devnum")) as f:
+                dev = int(f.read())
+            return f"/dev/bus/usb/{bus:03d}/{dev:03d}"
+        except (OSError, ValueError):
+            d = os.path.dirname(d)
+    return None
 
 
 class Transport:
@@ -314,6 +339,46 @@ class Transport:
             same_kind = next((d for d in devices if d["is_dongle"] == was_dongle), None) if was_dongle is not None else None
             self.hidraw_path = same_kind["path"] if same_kind else None
         self.open()
+
+    @_locked
+    def reset_usb_device(self, settle_sec: float = RESET_SETTLE_SEC):
+        """
+        Resets the USB device behind the open node (USBDEVFS_RESET), then reopens it.
+        This is what plugging the device in does, minus the power cut: Maxwell dongles can get
+        stuck answering every query with an empty report, and a replug is the known cure.
+        Audio drops for about a second. Needs write access to the /dev/bus/usb node, which the
+        udev rule grants (DevicePermissionError otherwise). Refused during a firmware update.
+        """
+        if self.dry_run:
+            return
+        if self.exclusive or not self.auto_reconnect:
+            raise DeviceBusyError("Not resetting the device during a firmware update.")
+        node = usb_device_node(self.hidraw_path) if self.hidraw_path else None
+        if not node:
+            raise DeviceNotFoundError(f"No USB device found behind {self.hidraw_path}.")
+        try:
+            fd = os.open(node, os.O_WRONLY)
+        except PermissionError:
+            raise DevicePermissionError(
+                f"No permission to reset {node}. Run 'audezeforlinux setup-udev' once (it adds the rule "
+                "that allows it), then replug the dongle."
+            )
+        was_dongle = self.node_is_dongle
+        try:
+            fcntl.ioctl(fd, USBDEVFS_RESET, 0)
+        except OSError as e:
+            # ENODEV: the device re-enumerated instead of resetting in place, which is fine too
+            if e.errno != errno.ENODEV:
+                raise
+        finally:
+            os.close(fd)
+        # Usually reset in place (same node), but it may re-enumerate under a new one
+        deadline = time.time() + settle_sec
+        while True:
+            time.sleep(0.5)
+            if any(d["is_dongle"] == was_dongle for d in list_maxwell_devices()) or time.time() >= deadline:
+                break
+        self.reconnect(prefer_dongle=was_dongle)
 
     def __enter__(self):
         self.open()
@@ -471,6 +536,34 @@ class Transport:
             time.sleep(0.02)
 
         return packets
+
+    @_locked
+    def node_answers(self, probe_packet: bytes, timeout_sec: float = 1.5) -> bool:
+        """
+        Sends a read request to the opened node itself (route 0x00: the dongle, or the headset on
+        USB-C) and reports whether anything at all comes back. Any RACE packet counts: a stuck
+        dongle sends nothing, not even unrelated notifications.
+        """
+        if self.dry_run:
+            return True
+        self.drain()
+        try:
+            self.write_race_packet(probe_packet, is_dongle=False)
+        except (OSError, RuntimeError):
+            return False
+        stream = InputStream()
+        deadline = time.time() + timeout_sec
+        while time.time() < deadline:
+            report = self.poll_input_report()
+            if not report:
+                time.sleep(0.02)
+                continue
+            try:
+                if stream.feed(report):
+                    return True
+            except ProtocolError:
+                continue
+        return False
 
     MAX_PENDING_NOTIFICATIONS = 64
 

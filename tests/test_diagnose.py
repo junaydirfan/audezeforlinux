@@ -224,12 +224,17 @@ class TestHonestStatus(unittest.TestCase):
             product_id = 0x4B19
             is_dongle = True
 
+            def node_answers(self, packet, timeout_sec=1.5):
+                return True  # the dongle answers; the headset (battery query below) doesn't
+
         client = MaxwellClient(Silent())
+        client.get_battery = mock.Mock(return_value=None)
         fail = mock.Mock(side_effect=TimeoutError("no reply"))
         with mock.patch.multiple(MaxwellClient, get_preset=fail, get_power=fail, get_mic_mute=fail,
                                  get_sidetone=fail, get_chat_mix=fail, get_noise_reduction=fail,
                                  get_firmware=mock.Mock(return_value={"firmware": "Unknown", "dongle": "Unknown",
-                                                                      "headset": "Unknown", "match": True})):
+                                                                      "headset": "Unknown", "match": True})), \
+                mock.patch("maxwell2.client.record_event"):
             status = client.get_status()
         self.assertFalse(status["device_responding"])
         self.assertEqual(set(status["unreadable"]), {"preset", "battery", "firmware", "mic_muted", "sidetone",

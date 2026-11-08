@@ -24,7 +24,14 @@ try:
 except ImportError:
     CURSES_AVAILABLE = False
 
-from maxwell2.client import MaxwellClient, BATTERY_CHARGING, BATTERY_CHARGED
+from maxwell2.client import (
+    MaxwellClient,
+    BATTERY_CHARGING,
+    BATTERY_CHARGED,
+    LINK_DONGLE_SILENT,
+    LINK_HEADSET_SILENT,
+    LINK_USB_SILENT,
+)
 from maxwell2.protocol import (
     PRESET_NAMES,
     build_write_control_command,
@@ -213,13 +220,15 @@ class CursesTUI:
         except Exception as e:
             self.message = f"Hardware note: using initial baseline state ({e})"
 
-        try:
-            raw_eq = self.client.read_custom_eq(self.active_eq_slot)
-            bands = raw_eq.get("bands", [])
-            if bands:
-                self.current_eq_bands = copy.deepcopy(bands)
-        except Exception:
-            pass
+        # A silent headset would only make every EQ read wait out its timeouts
+        if self.status.get("device_responding") is not False:
+            try:
+                raw_eq = self.client.read_custom_eq(self.active_eq_slot)
+                bands = raw_eq.get("bands", [])
+                if bands:
+                    self.current_eq_bands = copy.deepcopy(bands)
+            except Exception:
+                pass
 
         try:
             self.system_backups = list_backups()
@@ -231,8 +240,33 @@ class CursesTUI:
         return not self.loading and self.status.get("device_responding") is not False
 
     def no_response_message(self) -> str:
+        """Says which part is silent (from get_status's link check) and what was already tried."""
+        link = self.status.get("link")
+        action = (self.status.get("recovery") or {}).get("action")
+        if link == LINK_DONGLE_SILENT:
+            if action == "no_permission":
+                return ("The dongle stopped answering (it can get stuck). Replug it, or run "
+                        "'audezeforlinux setup-udev' once so the app can reset it for you. [r] retry")
+            if action == "reset":
+                return "The dongle stopped answering and a reset didn't help: unplug it for 5 seconds. [r] retry"
+            return "The dongle stopped answering (it can get stuck): replug it. [r] retry"
+        if link == LINK_HEADSET_SILENT:
+            if action == "reset":
+                return "Dongle reset: it answers again, but the headset doesn't yet. Is it on? [r] retry"
+            return ("The dongle answers, but the headset doesn't: is it on and linked? If it is, run "
+                    "'audezeforlinux reset-dongle' or replug the dongle. [r] retry")
+        if link == LINK_USB_SILENT:
+            return "The headset's USB-C connection doesn't answer: replug the cable. [r] retry"
         return ("No response: is the headset on and linked? If so, replug the dongle (it can get stuck). "
                 "[r] retry; 'audezeforlinux doctor' diagnoses it.")
+
+    def loaded_message(self) -> Optional[str]:
+        """Message once status was read, mentioning an automatic dongle reset that made it work."""
+        if self.status.get("device_responding") is False:
+            return self.no_response_message()
+        if (self.status.get("recovery") or {}).get("recovered") and self.status["recovery"]["action"] == "reset":
+            return "The dongle had stopped answering, so it was reset: status loaded."
+        return None
 
     def sent_message(self, text: str) -> str:
         """Fast writes aren't acknowledged, so don't claim success to a silent headset."""
@@ -264,11 +298,28 @@ class CursesTUI:
             return
         was_silent = self.status.get("device_responding") is False
         self.status.update(power)
-        if was_silent and power.get("battery_percent") is not None:
+        recovered = False
+        if was_silent and power.get("battery_percent") is None and hasattr(self.client, "recover_stuck_dongle"):
+            # Still silent: if the dongle itself got stuck (e.g. when the headset was switched on
+            # while the dashboard was open), reset it. Rate-limited by the client.
+            try:
+                recovery = self.client.recover_stuck_dongle()
+            except Exception:
+                return
+            self.status["link"] = recovery.get("link_after", recovery["link"])
+            if recovery["action"] != "already_tried":
+                self.status["recovery"] = recovery
+            recovered = recovery["recovered"]
+            if not recovered:
+                if recovery["action"] in ("reset", "no_permission", "failed"):
+                    self.message = self.no_response_message()
+                return
+        if was_silent and (recovered or power.get("battery_percent") is not None):
             self.loading = True
             try:
                 self.status.update(self.client.get_status())
-                self.message = "Headset is answering again: status reloaded."
+                self.message = ("The dongle had stopped answering, so it was reset: status reloaded." if recovered
+                                else "Headset is answering again: status reloaded.")
             except Exception as e:
                 self.message = f"Refresh note: {e}"
             finally:
@@ -296,10 +347,7 @@ class CursesTUI:
         def load_hardware_state():
             try:
                 self.load_initial_hardware_state()
-                if self.status.get("device_responding") is False:
-                    self.message = self.no_response_message()
-                else:
-                    self.message = "Hardware status loaded. Use Arrow Keys to navigate."
+                self.message = self.loaded_message() or "Hardware status loaded. Use Arrow Keys to navigate."
             except Exception as e:
                 self.message = f"Hardware status notice: {e}"
             finally:
@@ -1004,6 +1052,8 @@ class CursesTUI:
     def select_eq_slot(self, slot_idx: int):
         """Loads custom slot from hardware."""
         self.active_eq_slot = slot_idx
+        if self.status.get("device_responding") is False:
+            return  # every EQ read would only wait out its timeouts
         try:
             raw_eq = self.client.read_custom_eq(self.active_eq_slot)
             self.current_eq_bands = copy.deepcopy(raw_eq.get("bands", []))
@@ -1094,10 +1144,7 @@ class CursesTUI:
             self.status.update(live)
             self.last_power_poll = time.time()
             self.system_backups = list_backups()
-            if live.get("device_responding") is False:
-                self.message = self.no_response_message()
-            else:
-                self.message = "Telemetry refreshed from headset."
+            self.message = self.loaded_message() or "Telemetry refreshed from headset."
         except Exception as e:
             self.message = f"Refresh note: {e}"
 

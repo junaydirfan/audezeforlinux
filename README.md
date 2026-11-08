@@ -143,10 +143,13 @@ audezeforlinux doctor
 
 | Doctor says | What it means | Fix |
 | :---------- | :------------ | :-- |
-| *Nothing answers, not even the dongle itself* | The dongle is stuck. Maxwell dongles (original and Maxwell 2) can get into a state where they keep playing audio and even apply setting changes, but answer every query with an empty report, until they're replugged. Also seen by HeadsetControl users ([#460](https://github.com/Sapd/HeadsetControl/issues/460), [#573](https://github.com/Sapd/HeadsetControl/issues/573)) | Unplug the dongle, wait 5 seconds, plug it back in (straight into the PC if you use the short USB-C extension) |
-| *The dongle answers, but the headset doesn't* | The headset is off, asleep, or not linked to the dongle | Switch it on; re-pair it if it stays silent |
+| *Nothing answers, not even the dongle itself* | The dongle is stuck. Maxwell dongles (original and Maxwell 2) can get into a state where they keep playing audio and even apply setting changes, but answer every query with an empty report, until they're replugged. It tends to happen when the headset is switched on and the dongle re-connects to it. Also seen by HeadsetControl users ([#460](https://github.com/Sapd/HeadsetControl/issues/460), [#573](https://github.com/Sapd/HeadsetControl/issues/573)) | The app resets the dongle over USB by itself (audio drops for a second), once you've run `setup-udev` with this version. If that doesn't help, unplug the dongle, wait 5 seconds, plug it back in (straight into the PC if you use the short USB-C extension) |
+| *The dongle answers, but the headset doesn't* | The headset is off, asleep, or not linked to the dongle | Switch it on; re-pair it if it stays silent. If it is on and linked, try `audezeforlinux reset-dongle` |
 | *Permission denied* | No udev rule for your user | `audezeforlinux setup-udev`, then replug the device |
 | *Other programs have this device open* | Another tool (HeadsetControl, a battery widget, Audeze HQ under Wine...) is polling the dongle and can take the replies | Close it and retry |
+| *Udev Configuration: out of date* | The rule predates automatic dongle resets | Run `audezeforlinux setup-udev` again |
+
+`status` and the dashboard check this themselves: when the headset doesn't answer, they find out whether the dongle itself is stuck and reset it once, instead of making you replug it. Each time that happens is logged to `~/.local/state/audezeforlinux/events.log`, and `doctor` shows the latest under *Recent Problems*. Please include it when you report a dongle that keeps getting stuck.
 
 ### Bazzite, Silverblue, SteamOS and other immutable systems
 

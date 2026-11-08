@@ -30,9 +30,46 @@ KERNEL=="hidraw*", ATTRS{idVendor}=="3329", ATTRS{idProduct}=="4b18", TAG+="uacc
 KERNEL=="hidraw*", ATTRS{idVendor}=="3329", ATTRS{idProduct}=="4b19", TAG+="uaccess", MODE="0666"
 KERNEL=="hidraw*", ATTRS{idVendor}=="3329", ATTRS{idProduct}=="4b1a", TAG+="uaccess", MODE="0666"
 KERNEL=="hidraw*", ATTRS{idVendor}=="3329", ATTRS{idProduct}=="4b1e", TAG+="uaccess", MODE="0666"
+
+# Dongles: let the session user reset the dongle over USB (what a replug does), so the app can
+# recover a dongle that has stopped answering. Only the dongles' USB device nodes, no MODE change.
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="3329", ATTR{idProduct}=="4b18", TAG+="uaccess"
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="3329", ATTR{idProduct}=="4b19", TAG+="uaccess"
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="3329", ATTR{idProduct}=="4b28", TAG+="uaccess"
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="3329", ATTR{idProduct}=="4b29", TAG+="uaccess"
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="3329", ATTR{idProduct}=="4ba8", TAG+="uaccess"
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="3329", ATTR{idProduct}=="4ba9", TAG+="uaccess"
 """
 
 UDEV_DEST_PATH = "/etc/udev/rules.d/70-audeze-maxwell.rules"
+
+
+def udev_rule_allows_reset(path: str) -> bool:
+    """True if the installed rule has the dongle USB-node line that lets the app reset a stuck dongle."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            return 'ENV{DEVTYPE}=="usb_device"' in f.read()
+    except OSError:
+        return False
+
+
+def describe_event(event: Dict[str, Any]) -> str:
+    """One line for an events.log entry, e.g. '2026-11-08T08:30 dongle stopped answering: reset, fixed'."""
+    when = str(event.get("time", "?"))[:16]
+    what = {
+        "dongle_silent": "dongle stopped answering",
+        "headset_silent": "headset not answering",
+        "usb_silent": "headset USB-C not answering",
+    }.get(event.get("event"), str(event.get("event")))
+    action = event.get("action")
+    if action == "reset":
+        outcome = "reset, fixed" if event.get("recovered") else f"reset, still {event.get('link_after') or 'silent'}"
+        return f"{when} {what}: {outcome}"
+    if action == "no_permission":
+        return f"{when} {what}: couldn't reset (udev rule out of date)"
+    if action == "failed":
+        return f"{when} {what}: reset failed ({event.get('detail')})"
+    return f"{when} {what}"
 
 
 def run_doctor() -> Dict[str, Any]:
@@ -61,11 +98,17 @@ def run_doctor() -> Dict[str, Any]:
 
     # 3. Udev rule installation
     rule_installed = os.path.exists(UDEV_DEST_PATH)
-    results["udev_rule"] = {
-        "status": rule_installed,
-        "detail": UDEV_DEST_PATH if rule_installed else "Not installed in /etc/udev/rules.d/",
-        "advice": "Run './audezeforlinux setup-udev' to configure automatically" if not rule_installed else "Active",
-    }
+    rule_current = rule_installed and udev_rule_allows_reset(UDEV_DEST_PATH)
+    if not rule_installed:
+        rule_detail, rule_advice = "Not installed in /etc/udev/rules.d/", \
+            "Run './audezeforlinux setup-udev' to configure automatically"
+    elif not rule_current:
+        rule_detail = f"{UDEV_DEST_PATH} (out of date: the app can't reset a stuck dongle)"
+        rule_advice = ("Run './audezeforlinux setup-udev' again: the new rule lets the app reset a dongle that "
+                       "stopped answering, instead of you replugging it")
+    else:
+        rule_detail, rule_advice = UDEV_DEST_PATH, "Active"
+    results["udev_rule"] = {"status": rule_current, "detail": rule_detail, "advice": rule_advice}
 
     # 4. Device detection & permissions
     from maxwell2.transport import list_maxwell_devices
@@ -117,6 +160,17 @@ def run_doctor() -> Dict[str, Any]:
             "nodes": live["nodes"],
         }
 
+    # 4c. Recent connection problems the app ran into (e.g. a stuck dongle it reset)
+    from maxwell2.events import recent_events
+    events = recent_events()
+    if events:
+        results["recent_events"] = {
+            "status": True,  # informational: a past problem isn't a current failure
+            "detail": f"{len(events)} recent, last: {describe_event(events[-1])}",
+            "advice": "",
+            "events": events,
+        }
+
     # 5. Audio server (PipeWire / WirePlumber)
     audio_server = "Linux Audio"
     pipewire_active = False
@@ -151,6 +205,7 @@ def format_doctor_report(diag: Dict[str, Any]) -> str:
         ("Udev Configuration", diag.get("udev_rule", {})),
         ("Environment", diag.get("environment", {})),
         ("Headset Connection", diag.get("connection", {})),
+        ("Recent Problems", diag.get("recent_events", {})),
         ("Audio Server", diag.get("audio_server", {})),
     ]
     items = [(title, info) for title, info in items if info]

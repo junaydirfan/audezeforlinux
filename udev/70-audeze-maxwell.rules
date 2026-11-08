@@ -16,3 +16,12 @@ KERNEL=="hidraw*", ATTRS{idVendor}=="3329", ATTRS{idProduct}=="4b2e", TAG+="uacc
 # Maxwell 2 ANC
 KERNEL=="hidraw*", ATTRS{idVendor}=="3329", ATTRS{idProduct}=="4ba8", TAG+="uaccess"
 KERNEL=="hidraw*", ATTRS{idVendor}=="3329", ATTRS{idProduct}=="4ba9", TAG+="uaccess"
+
+# Dongles: let the session user reset the dongle over USB (what a replug does), so the app can
+# recover a dongle that has stopped answering. Only the dongles' USB device nodes, no MODE change.
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="3329", ATTR{idProduct}=="4b18", TAG+="uaccess"
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="3329", ATTR{idProduct}=="4b19", TAG+="uaccess"
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="3329", ATTR{idProduct}=="4b28", TAG+="uaccess"
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="3329", ATTR{idProduct}=="4b29", TAG+="uaccess"
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="3329", ATTR{idProduct}=="4ba8", TAG+="uaccess"
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="3329", ATTR{idProduct}=="4ba9", TAG+="uaccess"

@@ -3,9 +3,9 @@ import threading
 import curses
 from unittest import mock
 
-from maxwell2.client import MaxwellClient
+from maxwell2.client import LINK_DONGLE_SILENT, MaxwellClient
 from maxwell2.interactive import CursesTUI
-from maxwell2.transport import DONGLE_PIDS, KNOWN_PIDS, Transport
+from maxwell2.transport import DONGLE_PIDS, KNOWN_PIDS, DevicePermissionError, Transport
 
 
 class FakeScreen:
@@ -122,9 +122,18 @@ class SilentDeviceStatusTests(unittest.TestCase):
             def query_notification(self, packet, timeout_sec=2.0):
                 return None
 
-        status = MaxwellClient(SilentTransport()).get_status()
+            def node_answers(self, packet, timeout_sec=1.5):
+                return False
+
+            def reset_usb_device(self):
+                raise DevicePermissionError("no access")
+
+        with mock.patch("maxwell2.client.record_event"):
+            status = MaxwellClient(SilentTransport()).get_status()
 
         self.assertFalse(status["device_responding"])
+        self.assertEqual(status["link"], LINK_DONGLE_SILENT)
+        self.assertEqual(status["recovery"]["action"], "no_permission")
 
     def test_get_status_is_live_in_dry_run(self):
         self.assertTrue(MaxwellClient(Transport(dry_run=True)).get_status()["device_responding"])
