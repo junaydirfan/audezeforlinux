@@ -94,7 +94,7 @@ cd audezeforlinux
 # 1. Install udev rules for non-root hardware access (auto-prompts sudo & reloads udev)
 ./audezeforlinux setup-udev
 
-# 2. Install desktop launcher and user PATH symlink (~/.local/bin/audezeforlinux)
+# 2. Install desktop launcher and user PATH symlinks (~/.local/bin/audezeforlinux, and the short 'afl')
 ./audezeforlinux install-system
 
 # 3. Verify your Linux audio environment and device permissions
@@ -104,10 +104,12 @@ cd audezeforlinux
 
 ### 2. Launch the Interactive Studio Dashboard
 ```bash
-audezeforlinux dashboard
+afl              # short for: audezeforlinux dashboard
+afl db           # same thing
 # or from the cloned directory:
 ./audezeforlinux dashboard
 ```
+`afl` works for every command (`afl status`, `afl eq preset 3`, ...). `install-system` leaves it out if another program on your system is already called `afl`.
 
 ---
 

@@ -21,6 +21,7 @@ dependencies = []
 
 [project.scripts]
 audezeforlinux = "maxwell_ctl:main"
+afl = "maxwell_ctl:main"
 maxwell-ctl = "maxwell_ctl:main"
 
 [tool.setuptools.packages.find]

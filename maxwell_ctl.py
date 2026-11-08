@@ -149,20 +149,23 @@ def main():
     prog_name = os.path.basename(sys.argv[0]) if sys.argv and sys.argv[0] else "audezeforlinux"
     parser = argparse.ArgumentParser(
         prog=prog_name,
-        description="audezeforlinux: Safe Linux control tool for Audeze Maxwell 2 headset and USB dongle.",
+        description="audezeforlinux: Safe Linux control tool for Audeze Maxwell 2 headset and USB dongle. "
+                    "Without a command it opens the dashboard ('afl' is the short name, 'db' short for dashboard).",
     )
     parser.add_argument("--device", help="Direct path to /dev/hidraw node (auto-detected by default)")
     parser.add_argument("--dry-run", action="store_true", help="Simulate commands and print bytes without sending")
     parser.add_argument("--json", action="store_true", help="Format CLI output as JSON")
     parser.add_argument("--plain", action="store_true", help="Disable rich terminal colors and formatting")
 
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    # No command opens the dashboard (in a terminal), the thing people run most
+    subparsers = parser.add_subparsers(dest="command")
 
     # 1. status
     subparsers.add_parser("status", help="Read headset status (battery, preset, mic, controls)")
 
     # 2. dashboard / interactive
-    subparsers.add_parser("dashboard", help="Open live interactive keyboard-controlled dashboard")
+    subparsers.add_parser("dashboard", aliases=["db"], help="Open live interactive keyboard-controlled dashboard "
+                                                            "(also: db, or no command at all)")
     subparsers.add_parser("interactive", help="Alias for dashboard")
 
     # 3. eq
@@ -241,6 +244,11 @@ def main():
     subparsers.add_parser("install-system", help="Install desktop application entry and user PATH symlink to ~/.local/bin")
 
     args = parser.parse_args()
+    if args.command is None:
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+            parser.print_help()
+            sys.exit(2)
+        args.command = "dashboard"
 
     # Handle system tools (doctor, setup-udev, install-system)
     if args.command == "doctor":
@@ -468,7 +476,7 @@ def main():
         with transport:
             client = MaxwellClient(transport)
 
-            if args.command in ("dashboard", "interactive"):
+            if args.command in ("dashboard", "db", "interactive"):
                 from maxwell2.interactive import run_interactive_dashboard
                 run_interactive_dashboard(client)
                 return

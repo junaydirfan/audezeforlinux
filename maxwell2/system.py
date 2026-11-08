@@ -297,6 +297,8 @@ def install_desktop_integration(repo_dir: str) -> Tuple[bool, str]:
     except Exception as e:
         return False, f"Failed to create symlink: {e}"
 
+    short_note = install_short_command(local_bin, source_exec)
+
     apps_dir = os.path.expanduser("~/.local/share/applications")
     os.makedirs(apps_dir, exist_ok=True)
     desktop_file = os.path.join(apps_dir, "audezeforlinux.desktop")
@@ -314,4 +316,28 @@ Icon=audio-headphones
     with open(desktop_file, "w") as f:
         f.write(desktop_entry)
 
-    return True, f"✔ Installed desktop launcher to {desktop_file} and symlink to {symlink_path}."
+    return True, f"✔ Installed desktop launcher to {desktop_file} and symlink to {symlink_path}.\n{short_note}"
+
+
+SHORT_COMMAND = "afl"
+
+
+def install_short_command(local_bin: str, source_exec: str) -> str:
+    """
+    Adds the short name 'afl' next to the full one, unless that name already belongs to something
+    else: in ~/.local/bin (a file that isn't our symlink) or elsewhere on PATH.
+    """
+    path = os.path.join(local_bin, SHORT_COMMAND)
+    ours = os.path.islink(path) and os.path.realpath(path) == os.path.realpath(source_exec)
+    if os.path.lexists(path) and not ours:
+        return f"  '{SHORT_COMMAND}' not added: {path} already exists and isn't audezeforlinux."
+    other = shutil.which(SHORT_COMMAND)
+    if other and os.path.realpath(other) != os.path.realpath(source_exec) and \
+            os.path.dirname(os.path.abspath(other)) != os.path.abspath(local_bin):
+        return f"  '{SHORT_COMMAND}' not added: another program already uses that name ({other})."
+    if not ours:
+        try:
+            os.symlink(source_exec, path)
+        except OSError as e:
+            return f"  '{SHORT_COMMAND}' not added: {e}"
+    return f"✔ Short command: '{SHORT_COMMAND}' (or '{SHORT_COMMAND} db') opens the dashboard."
