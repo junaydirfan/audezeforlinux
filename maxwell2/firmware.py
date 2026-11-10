@@ -6,7 +6,9 @@ offline TLV/LZMA container parsing, partition hash verification, and FOTA stream
 
 import os
 import sys
+import json
 import struct
+import urllib.request
 import hashlib
 import binascii
 import re
@@ -172,6 +174,41 @@ KNOWN_PACKAGE_TRACKS: Dict[str, str] = {
     "6eee723fda209d91744381a2b1f6c41b3df4d6e045f6038e7766b5d450b20259": "maxwell2",  # Maxwell2_XBOX_dongle_v1.0.5.7.4.bin
     "a3c3d54183628dee68655aef204ece820b49fed6f8aaaffbd3407672b01afe4a": "maxwell2",  # Maxwell2_XBOX_headset_v1.0.5.7.4.bin
 }
+
+
+# Audeze's update manifests, the ones the official Windows app reads. Only the regular Maxwell 2 track
+# has a known current one: the ANC bucket only exposes a rollback list (see MAXWELL2_FIRMWARE_NOTES.md).
+OFFICIAL_BUCKET = "https://audeze-maxwell2.s3.us-east-1.amazonaws.com/"
+OFFICIAL_MANIFESTS = {"maxwell2": OFFICIAL_BUCKET + "maxwell-2-fw.json"}
+MANIFEST_PACKAGE_KEYS = ("ps_dongle", "ps_headset", "xbox_dongle", "xbox_headset")
+MAXWELL1_PIDS = (0x4B18, 0x4B19, 0x4B1A, 0x4B1E)
+
+
+def track_from_pid(pid: Optional[int]) -> Optional[str]:
+    """Catalog track the USB product id proves, or None when the PID alone can't tell (Maxwell 2 USB-C
+    ids are not known to be ANC-free, so they fall back to the version)."""
+    if pid in ANC_PIDS:
+        return "maxwell2_anc"
+    if pid in MAXWELL1_PIDS:
+        return "maxwell1"
+    return None
+
+
+def parse_official_manifest(data: Any) -> Dict[str, Any]:
+    """Validates a downloaded manifest: a version string, plus package links only inside Audeze's bucket."""
+    version = data.get("version") if isinstance(data, dict) else None
+    if not isinstance(version, str) or not re.fullmatch(r"v?\d+(\.\d+)+(_\w+)?", version.strip()):
+        raise ValueError("manifest has no valid version")
+    packages = {k: data[k] for k in MANIFEST_PACKAGE_KEYS
+                if isinstance(data.get(k), str) and data[k].startswith(OFFICIAL_BUCKET)}
+    return {"version": version.strip(), "packages": packages}
+
+
+def fetch_official_release(track: str, timeout: float = 5.0) -> Dict[str, Any]:
+    """Reads the latest release from Audeze's manifest. Raises OSError (network) or ValueError (bad data)."""
+    req = urllib.request.Request(OFFICIAL_MANIFESTS[track], headers={"User-Agent": "audezeforlinux"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return parse_official_manifest(json.loads(resp.read(64 * 1024)))
 
 
 def detect_device_track(current_version: str, strict: bool = False) -> Optional[str]:
@@ -493,22 +530,30 @@ def parse_version_tuple(ver_str: str) -> Tuple[int, ...]:
     return tuple(int(n) for n in nums) if nums else (0,)
 
 
-def check_available_updates(current_version: str, package_path: Optional[str] = None) -> Dict[str, Any]:
+def check_available_updates(current_version: str, package_path: Optional[str] = None,
+                            online: bool = False, track: Optional[str] = None) -> Dict[str, Any]:
     """
-    Evaluates update availability against the local baseline catalog or an explicit firmware package (.bin).
+    Evaluates update availability against Audeze's live manifest (online=True, falling back to the local
+    catalog when it can't be read), the local baseline catalog, or an explicit firmware package (.bin).
+    track (e.g. from track_from_pid) overrides the guess from the version string.
     Data provenance is explicitly surfaced to distinguish hardware reads from offline catalog entries.
     """
-    cat_key = detect_device_track(current_version) or "maxwell2"
+    # A failed read ("Unknown") has no digits; it must not be compared, or taken for Maxwell 1 firmware.
+    version_known = bool(re.search(r"\d", current_version or ""))
+    cat_key = track or (detect_device_track(current_version) if version_known else None) or "maxwell2"
     catalog = FIRMWARE_CATALOG.get(cat_key, FIRMWARE_CATALOG["maxwell2"])
 
-    current_tuple = parse_version_tuple(current_version)
+    current_tuple = parse_version_tuple(current_version or "")
 
     if package_path:
         pkg = FirmwarePackage(package_path)
         pkg_ver = pkg.version_string
         pkg_tuple = parse_version_tuple(pkg_ver)
 
-        if pkg_tuple > current_tuple:
+        if not version_known:
+            status = "INSTALLED VERSION UNKNOWN"
+            status_symbol = "?"
+        elif pkg_tuple > current_tuple:
             status = "UPGRADE AVAILABLE"
             status_symbol = "▲"
         elif pkg_tuple < current_tuple:
@@ -545,27 +590,49 @@ def check_available_updates(current_version: str, package_path: Optional[str] = 
         }
     else:
         latest_ver = catalog["current_stable"]
-        latest_tuple = parse_version_tuple(latest_ver)
-        is_up_to_date = (current_tuple >= latest_tuple)
-        status = "MATCHES OFFLINE BASELINE" if is_up_to_date else "OFFLINE UPDATE AVAILABLE"
-        notice = "Audeze has no public cloud REST API. This check is evaluated against our local baseline catalog (not a live Audeze HQ cloud query). To check a downloaded update, run with --package <file.bin>."
-        if not catalog.get("baseline_complete", True):
-            status = "LATEST RELEASE UNKNOWN" if is_up_to_date else status
-            notice = (
-                f"The local catalog for {catalog['model']} is incomplete: {latest_ver} is the newest release "
-                "we know of, but Audeze may have published a newer one. " + notice
-            )
+        packages: Dict[str, str] = {}
+        live = False
+        offline_notice = ("This check is evaluated against our local baseline catalog. "
+                          "To check a downloaded update, run with --package <file.bin>.")
+        notice = offline_notice
+        if online and cat_key in OFFICIAL_MANIFESTS:
+            try:
+                official = fetch_official_release(cat_key)
+                latest_ver, packages, live = official["version"], official["packages"], True
+                notice = "Checked against Audeze's update manifest, the list the official app reads."
+                if parse_version_tuple(latest_ver) > parse_version_tuple(catalog["current_stable"]):
+                    notice += f" {latest_ver} is newer than our local catalog, so its changelog isn't listed below."
+            except (OSError, ValueError) as e:
+                notice = f"Couldn't read Audeze's update manifest ({e}). " + offline_notice
+        elif online:
+            notice = f"Audeze publishes no known update manifest for {catalog['model']}. " + offline_notice
+
+        is_up_to_date = (current_tuple >= parse_version_tuple(latest_ver)) if version_known else None
+        if is_up_to_date is None:
+            status = "INSTALLED VERSION UNKNOWN"
+            notice = "The device didn't report its firmware version (is it connected and switched on?). " + notice
+        elif live:
+            status = "UP TO DATE" if is_up_to_date else "UPDATE AVAILABLE"
+        else:
+            status = "MATCHES OFFLINE BASELINE" if is_up_to_date else "OFFLINE UPDATE AVAILABLE"
+            if not catalog.get("baseline_complete", True):
+                status = "LATEST RELEASE UNKNOWN" if is_up_to_date else status
+                notice = (
+                    f"The local catalog for {catalog['model']} is incomplete: {latest_ver} is the newest release "
+                    "we know of, but Audeze may have published a newer one. " + notice
+                )
 
         return {
             "current_installed": current_version,
             "latest_available": latest_ver,
             "is_up_to_date": is_up_to_date,
             "status": status,
-            "status_symbol": "✔" if is_up_to_date else "●",
+            "status_symbol": {True: "✔", False: "●", None: "?"}[is_up_to_date],
             "model_detected": catalog["model"],
-            "source": "Offline Baseline Catalog (Local)",
+            "source": "Audeze Update Server (Live)" if live else "Offline Baseline Catalog (Local)",
             "is_package": False,
             "notice": notice,
+            "packages": packages,
             "releases": catalog["releases"],
         }
 
@@ -1428,6 +1495,8 @@ def format_firmware_check_plain(info: Dict[str, Any]) -> str:
     lines.append("┌─ AUDEZE FIRMWARE UPDATE CHECK ───────────────────────────────────────┐")
     lines.append(f"│  Hardware Model            : {info.get('model_detected', 'Unknown'):<38} │")
     lines.append(f"│  Current Installed Version : {info.get('current_installed', 'Unknown'):<38} │")
+    for node, ver in info.get("installed_nodes", {}).items():
+        lines.append(f"│    {node.capitalize():<24}: {ver:<38} │")
 
     if info.get("is_package"):
         lines.append(f"│  Target Package Version    : {info.get('target_version', 'Unknown'):<38} │")
@@ -1435,7 +1504,7 @@ def format_firmware_check_plain(info: Dict[str, Any]) -> str:
         lines.append(f"│  Package Firmware Track    : {info.get('package_track', 'unknown'):<38} │")
         lines.append(f"│  Package Integrity Check   : {'✔ SHA-256 PASS (Valid)' if info.get('package_valid') else '✖ CORRUPTED':<38} │")
     else:
-        lines.append(f"│  Latest Catalog Baseline   : {info.get('latest_available', 'Unknown'):<38} │")
+        lines.append(f"│  Latest Available Version  : {info.get('latest_available', 'Unknown'):<38} │")
 
     source = info.get("source", "Offline Catalog")
     lines.append(f"│  Check Source / Provenance : {source:<38} │")

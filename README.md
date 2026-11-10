@@ -217,7 +217,7 @@ audezeforlinux chatmix 50
 # Dual-node version parity verification and battery safety gate
 audezeforlinux firmware status
 
-# Check official Audeze release catalog and changelogs against installed version
+# Check Audeze's live update manifest (falls back to the local catalog; --offline skips the network)
 audezeforlinux firmware check
 
 # Compare a downloaded package against the installed version (flags wrong-track ANC/regular packages)

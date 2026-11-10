@@ -150,10 +150,10 @@ audezeforlinux firmware check
 # or compare directly against a downloaded firmware package:
 audezeforlinux firmware check --package path/to/firmware.bin
 ```
-Evaluates installed firmware against the known baseline catalog or directly against a downloaded official `.bin` package.
+Evaluates installed firmware against Audeze's live update manifest, the known baseline catalog, or a downloaded official `.bin` package.
 
 > [!NOTE]
-> Audeze does not provide a public, unauthenticated cloud REST API for checking new firmware. By default, `firmware check` evaluates against our offline verified baseline catalog. Use `--package <file.bin>` to compare against a newly acquired firmware binary directly.
+> For the regular Maxwell 2, `firmware check` reads `maxwell-2-fw.json` from Audeze's update bucket (the manifest the official Windows app reads). It falls back to the local catalog if that read fails, and says so. `--offline` skips the network. No current manifest is known for the ANC track or the Maxwell 1, so those are always checked against the local catalog. Through a dongle, both the dongle and headset versions are read, and the older one decides whether an update is due. An ANC or Maxwell 1 USB product ID picks the track directly. If the device doesn't report a version, the check says so rather than reporting "up to date".
 
 ### 3. Deep Package Inspection & Hash Verification
 ```bash

@@ -432,6 +432,43 @@ class TestCommandBuildersAndParsers(unittest.TestCase):
         self.assertEqual(same["package_track"], "maxwell2_anc")
         self.assertNotEqual(same["status"], "WRONG FIRMWARE TRACK")
 
+    def test_online_update_check(self):
+        """Live manifest check, its offline fallback, unknown installed versions and PID-based tracks."""
+        from unittest import mock
+        from maxwell2 import firmware as fw
+
+        bucket = fw.OFFICIAL_BUCKET
+        parsed = fw.parse_official_manifest({"version": "v1.0.6.1", "xbox_dongle": bucket + "mw2/x.bin",
+                                             "ps_dongle": "https://evil.example/x.bin"})
+        self.assertEqual(parsed, {"version": "v1.0.6.1", "packages": {"xbox_dongle": bucket + "mw2/x.bin"}})
+        for bad in ({}, {"version": "latest"}, ["v1.0.6.1"], {"version": 5}):
+            with self.assertRaises(ValueError):
+                fw.parse_official_manifest(bad)
+
+        with mock.patch.object(fw, "fetch_official_release", return_value=parsed):
+            chk = fw.check_available_updates("v1.0.5.7.4", online=True)
+            self.assertEqual((chk["status"], chk["latest_available"]), ("UPDATE AVAILABLE", "v1.0.6.1"))
+            self.assertIn("Live", chk["source"])
+            self.assertEqual(fw.check_available_updates("v1.0.6.1", online=True)["status"], "UP TO DATE")
+
+        with mock.patch.object(fw, "fetch_official_release", side_effect=OSError("timed out")):
+            chk = fw.check_available_updates("v1.0.5.7.4", online=True)
+            self.assertEqual(chk["status"], "MATCHES OFFLINE BASELINE")
+            self.assertIn("timed out", chk["notice"])
+
+        # A failed device read is not "up to date", and not Maxwell 1 firmware either.
+        chk = fw.check_available_updates("Unknown")
+        self.assertEqual((chk["status"], chk["is_up_to_date"]), ("INSTALLED VERSION UNKNOWN", None))
+        self.assertIn("Maxwell 2", chk["model_detected"])
+
+        # An ANC dongle PID settles the track, and ANC has no known manifest to fetch.
+        self.assertEqual(fw.track_from_pid(0x4BA8), "maxwell2_anc")
+        self.assertIsNone(fw.track_from_pid(0x4B2E))
+        with mock.patch.object(fw, "fetch_official_release") as fetch:
+            chk = fw.check_available_updates("v1.0.5.7.4", online=True, track="maxwell2_anc")
+            fetch.assert_not_called()
+            self.assertIn("ANC", chk["model_detected"])
+
     def test_fota_preflight_track_gating(self):
         """Preflight refuses cross-track packages and live Maxwell 2 flashes with an unknown device track."""
         from maxwell2.firmware import FirmwarePackage, FotaEngine, FotaSafetyError

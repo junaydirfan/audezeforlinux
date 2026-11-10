@@ -210,6 +210,7 @@ def main():
     fw_sub.add_parser("status", help="Read dual dongle & headset firmware status, parity, and safety readiness")
     fw_check = fw_sub.add_parser("check", help="Check official firmware catalog and changelog against installed version")
     fw_check.add_argument("--package", "-p", default=None, help="Optional path to a .bin package to verify against installed version")
+    fw_check.add_argument("--offline", action="store_true", help="Don't contact Audeze's update server; use the local catalog only")
     fw_inspect = fw_sub.add_parser("inspect", help="Offline inspection and validation of a firmware .bin package")
     fw_inspect.add_argument("file", help="Path to firmware .bin file to inspect")
     fw_unpack = fw_sub.add_parser("unpack", help="Decompress and extract firmware partitions to directory")
@@ -326,18 +327,27 @@ def main():
             return
 
         elif args.firmware_action == "check":
-            from maxwell2.firmware import check_available_updates, format_firmware_check_plain
-            # Try to query device version, or fallback to status
-            current_ver = "v1.0.5.7.4"
+            from maxwell2.firmware import (check_available_updates, format_firmware_check_plain,
+                                           parse_version_tuple, track_from_pid)
+            # A failed read stays "Unknown": assuming a version would report "up to date" for no reason.
+            current_ver, track, nodes = "Unknown", None, {}
             try:
                 transport = Transport(hidraw_path=args.device, dry_run=args.dry_run)
                 with transport:
-                    client = MaxwellClient(transport)
-                    fw = client.get_firmware()
-                    current_ver = fw.get("firmware", "v1.0.5.7.4")
+                    fw = MaxwellClient(transport).get_firmware()
+                    # Over USB-C the "dongle" query reaches the headset itself, so only a dongle has two nodes.
+                    nodes = {n: fw.get(n, "Unknown") for n in (("dongle", "headset") if transport.is_dongle else ("headset",))}
+                    track = track_from_pid(transport.product_id)
             except Exception:
                 pass
-            res = check_available_updates(current_ver, package_path=args.package)
+            known = [v for v in nodes.values() if v != "Unknown"]
+            if known:
+                # The older node decides whether an update is due.
+                current_ver = min(known, key=parse_version_tuple)
+            res = check_available_updates(current_ver, package_path=args.package,
+                                          online=not args.offline, track=track)
+            if len(nodes) > 1:
+                res["installed_nodes"] = nodes
             if args.json:
                 print(json.dumps(res, indent=2))
             else:
